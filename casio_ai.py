@@ -11,7 +11,7 @@ import textwrap
 import cv2
 
 # --- USER CONFIGURATION ---
-API_KEY = "AIzaSyAfXnIPlVQX4WrI2QYQqYCIPxRKEalglqc"
+API_KEY = "---"
 MODEL_NAME = "gemini-3.1-pro-preview"
 
 F1_PROMPT = """<system_instruction>
