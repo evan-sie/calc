@@ -1,0 +1,12 @@
+[Unit]
+Description=Retry WiFi connection after boot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/bin/bash -lc 'for i in 1 2 3 4 5; do if iwgetid -r wlan0 >/dev/null 2>&1; then exit 0; fi; ifdown wlan0 2>/dev/null || true; sleep 2; ifup wlan0 2>/dev/null || true; sleep 10; done; exit 0'
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target

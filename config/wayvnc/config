@@ -1,0 +1,4 @@
+# wayvnc is bound to 127.0.0.1 by cyberdeck_boot.sh, so authentication is
+# disabled for the local cgvm_vnc bridge.
+enable_auth=false
+max_fps=30

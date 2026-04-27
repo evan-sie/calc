@@ -1,0 +1,15 @@
+[Unit]
+Description=Casio FX-CG50 Cyberdeck
+After=multi-user.target network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/root
+ExecStart=/root/autostart_cyberdeck.sh
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,33 @@
+# Headless calculator display.
+# The FX-CG50 bridge expects exactly 396x224.
+output HEADLESS-1 {
+    resolution 396x224@60Hz
+    power on
+    dpms on
+    bg #ffffff solid_color
+}
+
+default_border none
+default_floating_border none
+gaps inner 0
+gaps outer 0
+focus_follows_mouse no
+
+# The AI terminal should fill the calculator screen without decorations.
+for_window [app_id="foot"] {
+    fullscreen enable
+    border none
+}
+
+# The camera viewfinder is a floating overlay. casio_ai.py temporarily exits
+# fullscreen before showing it, then restores fullscreen when it closes.
+for_window [app_id="mpv"] {
+    floating enable
+    resize set 396 224
+    move position 0 0
+    border none
+}
+
+no_focus [app_id="mpv"]
+
+exec foot -a foot -e python3 /root/casio_ai.py

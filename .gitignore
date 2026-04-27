@@ -1,0 +1,33 @@
+# Local shell/session artifacts
+.bash_history
+.bashrc
+.profile
+.DS_Store
+*.swp
+
+# Python caches and local environments
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Timestamped local backups
+*.bak.*
+
+# Previous SD-card backup and dependency source trees.
+# Important runtime pieces from boot_ai are copied into clean repo paths.
+boot_ai/
+
+# Build outputs
+build/
+dist/
+*.o
+*.a
+*.so
+
+# CG virtual monitor generated files
+cg-virtual-monitor/vnc-client/build/
+cg-virtual-monitor/vnc-client/build-win64/
+cg-virtual-monitor/vnc-client/cgvm_vnc
+cg-virtual-monitor/vnc-client/cgvm_vnc.exe
+cg-virtual-monitor/vnc-client/*.zip
