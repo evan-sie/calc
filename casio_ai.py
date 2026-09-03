@@ -244,12 +244,11 @@ def new_gemini_chat():
                 thinking_level=GEMINI_THINKING_LEVEL)))
 
 
-# Chat session for memory
-chat_session = None
+# Each Channel owns its own session; there is deliberately no module-level
+# one, so context can never be loaded into a session that nothing answers from.
 client = None
 try:
     client = genai.Client(api_key=API_KEY)
-    chat_session = new_gemini_chat()
 except Exception:
     client = None
 
@@ -299,9 +298,6 @@ active_channel = GEMINI
 # appends to it keeps working unchanged.
 chat_history = channels[active_channel].history
 scroll_offset = 0
-response_holder = []
-processing_step = ""
-response_wait_start = 0.0
 force_redraw = False
 redraw_lock = threading.Lock()
 restart_confirm_active = False
@@ -802,12 +798,8 @@ def show_class_selector(stdscr):
     finally:
         stdscr.timeout(50)
 
-def send_class_context(class_name, md_content, width):
-    global chat_session, processing_step, response_wait_start, response_holder
-    
-    chat_history.append([(f"[*] Loading {class_name} context...", STYLES['status_text'])])
-    
-    msg = f"""<class_context>
+def build_class_context_message(class_name, md_content):
+    return f"""<class_context>
 You are being initialized for a {class_name} engineering problem-solving session.
 The following document contains the exact methods, variable notation, and formulas
 used in this course. Read it carefully and completely.
@@ -821,7 +813,7 @@ used in this course. Read it carefully and completely.
 <initialization_instruction>
 For this entire session you MUST:
 1. Use the variable names and notation defined in the document above.
-   If the course uses a specific symbol for a quantity, use that symbol — no substitutions.
+   If the course uses a specific symbol for a quantity, use that symbol -- no substitutions.
 2. Apply the specific methods and formula forms shown above.
 3. When the class method and a general method differ, always prefer to use the class method.
 4. Treat this context as your ground truth for this subject.
@@ -830,89 +822,28 @@ Respond with this confirmation line once you have understood and digested the co
 "Context Loaded. Course: {class_name}"
 </initialization_instruction>"""
 
-    def _worker():
-        global chat_session, processing_step, response_wait_start, response_holder
-        try:
-            if client is None:
-                response_holder.append(
-                    "No Gemini key. Set GEMINI_API_KEY in %s" % ENV_FILE)
-                return
-            if chat_session is None:
-                chat_session = new_gemini_chat()
-            response_wait_start = time.time()
-            processing_step = "WAITING"
-            response = chat_session.send_message(msg)
-            processing_step = "SENT"
-            time.sleep(0.5)
-            response_holder.append(response.text)
-        except Exception as e:
-            response_holder.append(f"Net Error: {e}")
 
-    response_holder.clear()
-    processing_step = "..."
-    response_wait_start = 0.0
+def send_class_context(class_name, md_content, width):
+    """Prime every enabled model with the course notes.
 
-    worker = threading.Thread(target=_worker)
-    worker.start()
-
-    animation_frames = ['   ', '.  ', '.. ', '...']
-    tick_count = 0
-    frame_index = 0
-    
-    # We don't have stdscr here to redraw, so we wait for the thread 
-    # and let the main loop's diag_thread or the caller handle redraws if possible.
-    # Wait, the prompt says "animate a throbber in the status line while waiting".
-    # I will use sys._getframe(1).f_locals.get('stdscr') to get stdscr from main()
-    import sys
-    stdscr = sys._getframe(1).f_locals.get('stdscr')
-    
-    while worker.is_alive():
-        if tick_count % THROBBER_TICKS_PER_FRAME == 0:
-            frame_index = (frame_index + 1) % len(animation_frames)
-        status_text = format_status()
-        chat_history[-1] = [(status_text + animation_frames[frame_index], STYLES['status_text'])]
-        if stdscr:
-            draw_screen(stdscr, "")
-        time.sleep(THROBBER_TICK_SEC)
-        tick_count += 1
-
-    chat_history.pop()
-
-    if response_holder:
-        res = response_holder[0]
-        if res.startswith("Net Error"):
-            chat_history.append([(res, STYLES['diag_crit'])])
-        else:
-            chat_history.append([(res, STYLES['diag_ok'])])
-    else:
-        chat_history.append([("Error: No response from thread.", STYLES['diag_crit'])])
-        
-    if stdscr:
-        draw_screen(stdscr, "")
+    Both models must be primed from identical context or the cross-check is
+    comparing two different setups. This goes through the same Channel
+    machinery as a capture, so it is non-blocking and each model's
+    confirmation lands in its own conversation."""
+    msg = build_class_context_message(class_name, md_content)
+    for key in (GEMINI, OPENAI_CH):
+        ch = channels[key]
+        if not ch.enabled:
+            continue
+        add_to_channel(ch, f"[*] Loading {class_name}", width,
+                       force_style=STYLES['hint'])
+        ch.pending = (False, None, msg)
+        ch.retries = 0
+        ch.last_answer = None
+        launch_channel(ch, width)
 
 
 # --- STATUS / UPLOAD STATE MACHINE --------------------------------------------
-
-def format_status():
-    """Build the status line text based on current processing_step and stopwatch."""
-    step = processing_step
-    if step == "CAPTURING":
-        return "[*] Capturing"
-    if step == "UPLOADING":
-        return "[*] Uploading"
-    if step == "UPLOADED":
-        return "[*] Uploaded"
-    if step == "WAITING":
-        elapsed = max(0.0, time.time() - response_wait_start)
-        if elapsed < 60.0:
-            return f"[*] Waiting for response ({elapsed:.1f})"
-        mins = int(elapsed // 60)
-        secs = elapsed - (mins * 60)
-        return f"[*] Waiting for response ({mins}min{secs:.1f})"
-    if step == "SENT":
-        return "[*] Sent"
-    return "[*] ..."
-
 
 def _swaymsg(*args):
     """Fire a swaymsg command. Sway is the parent of this process, so SWAYSOCK
@@ -1410,8 +1341,8 @@ def process_key_input(key_char):
 
 
 def main(stdscr):
-    global scroll_offset, response_holder, force_redraw, chat_session, processing_step, restart_confirm_active
-    global input_mode, sym_active, response_wait_start
+    global scroll_offset, force_redraw, restart_confirm_active
+    global input_mode, sym_active
     global active_class_name, pending_class_md, context_confirm_active
 
     initialize_theme(stdscr)
@@ -1425,14 +1356,6 @@ def main(stdscr):
     height, width = stdscr.getmaxyx()
     current_input = ""
     needs_redraw = True
-
-    # Initialize Chat Session (fallback if module-level init failed)
-    try:
-        if not chat_session:
-            client = genai.Client(api_key=API_KEY)
-            chat_session = new_gemini_chat()
-    except Exception:
-        pass
 
     header_lines.append(get_diagnostics_styled())
     header_lines.append(get_model_header_segments())
@@ -1486,6 +1409,9 @@ def main(stdscr):
                 context_confirm_active = False
                 send_class_context(active_class_name, pending_class_md, width)
                 pending_class_md = None
+                refresh_model_header()
+                chat_area_height = height - len(header_lines) - 1
+                scroll_offset = max(0, len(chat_history) - chat_area_height)
                 needs_redraw = True
                 continue
             elif key == curses.KEY_F2:  # F2 to skip

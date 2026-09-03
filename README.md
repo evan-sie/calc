@@ -2397,8 +2397,8 @@ bill as output at $20/M. Measure again on real problems before extrapolating.
 ### Known Gap
 `send_class_context()` still loads class notes into Gemini's session only, so
 with a class context active the two models are not working from identical
-context. It also still uses the old blocking request path. Worth resolving
-alongside the notes rework.
+context. It also still uses the old blocking request path.
+**Fixed in the 2026-09-03 class-context entry below.**
 
 ## 2026-09-03 - Gemini Switched to 3.8 Flash (high)
 
@@ -2422,3 +2422,43 @@ model with `ThinkingConfig.thinking_level` set to `high`, not a separate id.
   2.4s on 3.1 Pro to 1.2s on 3.8 Flash.
 - Full photo path re-tested: 971KB capture, 14.4s wall clock for both models
   (was 18.6s).
+
+## 2026-09-03 - Class Context to Both Models (Regression Fix)
+
+### Context
+The Channel refactor gave Gemini its own session on `channels[GEMINI].session`,
+but `send_class_context()` was still writing to the module-level
+`chat_session`. Those are two different Gemini conversations, so the class
+context was being loaded into a session that nothing ever answered from -- the
+notes silently stopped reaching the model that reads your photos. This worked
+before the refactor, when both used the same global.
+
+### Changes Made
+- `send_class_context()` now primes **every enabled channel** through the same
+  `launch_channel()` path as a capture, so both models are initialised from
+  identical context and each confirmation lands in its own conversation. It is
+  non-blocking like the rest of the request path.
+- Split the prompt out into `build_class_context_message()`.
+- **Deleted the module-level `chat_session` entirely.** A second, stale Gemini
+  session is exactly how the context went missing; now each Channel owns the
+  only session it uses.
+- Removed the dead single-worker leftovers: `format_status()`,
+  `response_holder`, `processing_step`, `response_wait_start`, and the
+  `main()` chat-session fallback.
+
+### Conversation Memory
+Both models keep history across turns, which the class notes depend on:
+- Gemini uses its per-channel `chats` session.
+- OpenAI chains with `previous_response_id`, set from each response.
+
+### Verification
+Primed both models with a short throwaway course document ("velocity is written
+VX, gravity is 9.79"), then asked a follow-up in a separate turn:
+- Both returned `Context Loaded. Course: TESTCOURSE`.
+- Both answered the follow-up with `VX` and `9.79`, confirming each model
+  retained the context across turns rather than just echoing it back once.
+- `prev_response_id` was set on the OpenAI channel, and the follow-up call
+  billed only 247 input tokens -- the context was not re-sent.
+
+Tested with a small stand-in document rather than the real course notes, to
+keep the token spend down.
