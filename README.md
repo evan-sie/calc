@@ -2399,3 +2399,26 @@ bill as output at $20/M. Measure again on real problems before extrapolating.
 with a class context active the two models are not working from identical
 context. It also still uses the old blocking request path. Worth resolving
 alongside the notes rework.
+
+## 2026-09-03 - Gemini Switched to 3.8 Flash (high)
+
+### Changes Made
+- `MODEL_NAME` is now `gemini-3.8-flash` with a new `GEMINI_THINKING_LEVEL`
+  of `"high"`, replacing `gemini-3.1-pro-preview`.
+- Added `new_gemini_chat()`, which builds the session with
+  `ThinkingConfig(thinking_level=...)`. All four places that created a chat
+  session now go through it, so the thinking level cannot drift between the
+  module-level init, the `main()` fallback, `_gemini_request()`, and
+  `send_class_context()`.
+
+### Notes
+`models.list` confirms `gemini-3.8-flash` exists; `3.8 Flash (high)` is that
+model with `ThinkingConfig.thinking_level` set to `high`, not a separate id.
+
+### Verification
+- Live call returned `391` for `17*23`, and a follow-up in the same session
+  returned `782`, confirming session memory chains correctly.
+- Both models still answer in parallel; Gemini's first response dropped from
+  2.4s on 3.1 Pro to 1.2s on 3.8 Flash.
+- Full photo path re-tested: 971KB capture, 14.4s wall clock for both models
+  (was 18.6s).

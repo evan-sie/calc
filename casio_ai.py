@@ -7,6 +7,7 @@ import threading
 import signal
 import base64
 from google import genai
+from google.genai import types as genai_types
 from PIL import Image
 try:
     from openai import OpenAI
@@ -43,7 +44,8 @@ load_env_file()
 
 API_KEY = os.environ.get("GEMINI_API_KEY", "")
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
-MODEL_NAME = "gemini-3.1-pro-preview"
+MODEL_NAME = "gemini-3.8-flash"
+GEMINI_THINKING_LEVEL = "high"
 
 # Second opinion. Every captured photo goes to both models; the answers are
 # kept in separate conversations and never merged.
@@ -233,12 +235,21 @@ ALPHA_OVERRIDES = {}
 
 STYLES = {}
 
+def new_gemini_chat():
+    """Gemini chat session at the configured thinking level."""
+    return client.chats.create(
+        model=MODEL_NAME,
+        config=genai_types.GenerateContentConfig(
+            thinking_config=genai_types.ThinkingConfig(
+                thinking_level=GEMINI_THINKING_LEVEL)))
+
+
 # Chat session for memory
 chat_session = None
 client = None
 try:
     client = genai.Client(api_key=API_KEY)
-    chat_session = client.chats.create(model=MODEL_NAME)
+    chat_session = new_gemini_chat()
 except Exception:
     client = None
 
@@ -827,7 +838,7 @@ Respond with this confirmation line once you have understood and digested the co
                     "No Gemini key. Set GEMINI_API_KEY in %s" % ENV_FILE)
                 return
             if chat_session is None:
-                chat_session = client.chats.create(model=MODEL_NAME)
+                chat_session = new_gemini_chat()
             response_wait_start = time.time()
             processing_step = "WAITING"
             response = chat_session.send_message(msg)
@@ -1075,7 +1086,7 @@ def _gemini_request(ch, is_f1, path, text):
     if client is None:
         raise RuntimeError("No Gemini key. Set GEMINI_API_KEY in %s" % ENV_FILE)
     if ch.session is None:
-        ch.session = client.chats.create(model=MODEL_NAME)
+        ch.session = new_gemini_chat()
 
     if is_f1:
         ch.step = "UPLOADING"
@@ -1419,7 +1430,7 @@ def main(stdscr):
     try:
         if not chat_session:
             client = genai.Client(api_key=API_KEY)
-            chat_session = client.chats.create(model=MODEL_NAME)
+            chat_session = new_gemini_chat()
     except Exception:
         pass
 
