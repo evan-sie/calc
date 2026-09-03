@@ -5,8 +5,13 @@ import re
 import time
 import threading
 import signal
+import base64
 from google import genai
 from PIL import Image
+try:
+    from openai import OpenAI
+except ImportError:  # deck can still run Gemini-only
+    OpenAI = None
 import curses
 import textwrap
 import cv2
@@ -39,6 +44,14 @@ load_env_file()
 API_KEY = os.environ.get("GEMINI_API_KEY", "")
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
 MODEL_NAME = "gemini-3.1-pro-preview"
+
+# Second opinion. Every captured photo goes to both models; the answers are
+# kept in separate conversations and never merged.
+OPENAI_MODEL_NAME = "gpt-5.6-sol"
+OPENAI_REASONING_EFFORT = "max"
+
+# One silent retry before the deck asks what to do about a failing model.
+AUTO_RETRY_LIMIT = 1
 
 # Viewfinder (SYM+F1). Capture stops it -- the camera is exclusive.
 VF_WIDTH, VF_HEIGHT, VF_FPS = 320, 180, 15
@@ -130,6 +143,9 @@ DIAGNOSTIC_UPDATE_INTERVAL = 0.5
 # THROBBER_TICKS_PER_FRAME ticks. Net dots-per-second ~= 1 / (0.1 * 3).
 THROBBER_TICK_SEC = 0.1          # redraw / stopwatch refresh at 10 Hz
 THROBBER_TICKS_PER_FRAME = 3     # advance . . . every 3 ticks ~= 3.3 Hz
+THROBBER_FRAMES = ['   ', '.  ', '.. ', '...']
+throbber_frame = 0
+throbber_tick = 0
 
 # 256-color palette picks. These read well on a white background; 8-color
 # terminals fall back to the standard curses constants.
@@ -228,7 +244,49 @@ except Exception:
 
 # --- GLOBAL STATE ---
 header_lines = []
-chat_history = []
+
+
+GEMINI, OPENAI_CH = "GEMINI", "OPENAI"
+
+
+class Channel:
+    """One model's independent conversation.
+
+    Both channels receive every captured photo, but their histories are kept
+    apart -- switching the view must never clear or reset either one."""
+
+    def __init__(self, key, label):
+        self.key = key
+        self.label = label
+        self.history = []
+        self.scroll_offset = 0
+        self.status = "idle"      # idle | working | done | error | disabled
+        self.step = "..."
+        self.wait_start = 0.0
+        self.answer = None
+        self.error = None
+        self.thread = None
+        self.session = None       # genai chat session / OpenAI client
+        self.prev_response_id = None   # OpenAI conversation chaining
+        self.retries = 0
+        self.pending = None       # (is_f1, path, text) for a retry
+        self.awaiting_choice = False
+        self.status_index = None
+        self.last_answer = None   # extracted final number, for the DIFF marker
+        self.last_usage = None    # token usage of the last call, if reported
+        self.enabled = True
+
+    @property
+    def busy(self):
+        return self.thread is not None and self.thread.is_alive()
+
+
+channels = {GEMINI: Channel(GEMINI, "GEMINI"), OPENAI_CH: Channel(OPENAI_CH, "OPENAI")}
+active_channel = GEMINI
+
+# chat_history aliases the active channel's list, so every existing helper that
+# appends to it keeps working unchanged.
+chat_history = channels[active_channel].history
 scroll_offset = 0
 response_holder = []
 processing_step = ""
@@ -516,7 +574,8 @@ def render_splash_line(stdscr, y, block_x, w, line):
         cursor_x = block_x
         
         if gap > 0 and (stripped[:gap].startswith('F') or
-                        stripped[:gap] in ('Enter', 'Up/Down', 'Key', 'RSSI', 'SYM+F1')):
+                        stripped[:gap].startswith('SYM+') or
+                        stripped[:gap] in ('Enter', 'Up/Down', 'Key', 'RSSI')):
             key_part = stripped[:gap]
             rest_part = stripped[gap:]
             stdscr.addstr(y, cursor_x, " " * leading_ws, STYLES['normal'])
@@ -620,6 +679,9 @@ def get_startup_splash_lines():
     return [
         "F1      Capture & analyze image",
         "SYM+F1  Toggle camera viewfinder",
+        "SYM+F2  Switch model view",
+        "SYM+F3  Re-enable a stopped model",
+        "SYM+F5  Compare both answers",
         "F2      Toggle this splashscreen",
         "F4      Toggle SHIFT  (SYM, 1-press)",
         "F5      Toggle NUM/ALPHA",
@@ -929,76 +991,327 @@ def toggle_viewfinder(width):
         parse_and_add_history("[*] Viewfinder OFF", width)
 
 
-def processing_task(is_f1, current_input=None):
-    global response_holder, processing_step, chat_session, response_wait_start
-    global force_redraw
+# --- MODEL CHANNELS ---------------------------------------------------------
+
+def switch_channel(target=None):
+    """Flip the visible model. Neither history is touched."""
+    global active_channel, chat_history, scroll_offset
+    channels[active_channel].scroll_offset = scroll_offset
+    if target is None:
+        order = [GEMINI, OPENAI_CH]
+        target = order[(order.index(active_channel) + 1) % len(order)]
+    active_channel = target
+    chat_history = channels[active_channel].history
+    scroll_offset = channels[active_channel].scroll_offset
+    return channels[active_channel]
+
+
+def add_to_channel(ch, text, width, force_style=None):
+    """Append to a specific channel, whether or not it is the visible one."""
+    global chat_history
+    saved = chat_history
+    chat_history = ch.history
+    try:
+        parse_and_add_history(text, width, force_style)
+    finally:
+        chat_history = saved
+
+
+def other_channel(ch):
+    return channels[OPENAI_CH if ch.key == GEMINI else GEMINI]
+
+
+def format_channel_status(ch):
+    """Status line text for one channel's in-flight request."""
+    step = ch.step
+    if step == "CAPTURING":
+        return "[*] Capturing"
+    if step == "UPLOADING":
+        return "[*] Uploading"
+    if step == "UPLOADED":
+        return "[*] Uploaded"
+    if step == "WAITING":
+        elapsed = max(0.0, time.time() - ch.wait_start)
+        if elapsed < 60.0:
+            return f"[*] {ch.label} thinking ({elapsed:.1f})"
+        mins = int(elapsed // 60)
+        secs = elapsed - (mins * 60)
+        return f"[*] {ch.label} thinking ({mins}min{secs:.1f})"
+    return "[*] ..."
+
+
+_NUM_RE = re.compile(r"-?\d+(?:,\d{3})*(?:\.\d+)?(?:[eE][-+]?\d+)?")
+
+
+def extract_final_answer(text):
+    """Last number in a response -- a cheap stand-in for 'the final answer'.
+
+    Deliberately crude: it exists only to raise the DIFF marker, and returns
+    None whenever there is nothing numeric to compare."""
+    if not text:
+        return None
+    nums = _NUM_RE.findall(text)
+    if not nums:
+        return None
+    try:
+        return float(nums[-1].replace(",", ""))
+    except ValueError:
+        return None
+
+
+def answers_disagree():
+    """True only when both channels produced a comparable number and differ."""
+    a = channels[GEMINI].last_answer
+    b = channels[OPENAI_CH].last_answer
+    if a is None or b is None:
+        return False
+    scale = max(abs(a), abs(b), 1.0)
+    return abs(a - b) > 1e-6 * scale
+
+
+# --- PER-MODEL REQUESTS -----------------------------------------------------
+
+def _gemini_request(ch, is_f1, path, text):
+    if client is None:
+        raise RuntimeError("No Gemini key. Set GEMINI_API_KEY in %s" % ENV_FILE)
+    if ch.session is None:
+        ch.session = client.chats.create(model=MODEL_NAME)
 
     if is_f1:
-        path = "/tmp/capture.jpg"
-
-        # The camera is exclusive: the viewfinder must let go before capture.
-        # The overlay covers the whole screen, so a teardown needs a repaint.
-        if stop_viewfinder():
-            force_redraw = True
-
-        processing_step = "CAPTURING"
-        # OV5647 fixed focus at 7in. No AF motor -- instant capture.
-        cmd = ["rpicam-still", "-o", path, "-t", "100",
-               "--width", "2592", "--height", "1944",
-               "--exposure", "sport", "-q", "95", "-n", "--immediate"]
-        result = subprocess.run(cmd, capture_output=True, text=True)
-
-        if result.returncode != 0 or not os.path.exists(path):
-            err_tail = result.stderr.strip().split("\n")[-1][:30] if result.stderr else "unknown"
-            response_holder.append(f"Cam Fail: {err_tail}...")
-            return
-
-        processing_step = "UPLOADING"
+        ch.step = "UPLOADING"
         try:
-            if client is None:
-                response_holder.append(
-                    "No Gemini key. Set GEMINI_API_KEY in %s" % ENV_FILE)
-                return
-            if chat_session is None:
-                chat_session = client.chats.create(model=MODEL_NAME)
-
-            # Upload separately from the message so state can transition cleanly
-            # between UPLOADING and WAITING. Falls back to Files API if
-            # inline PIL image is unavailable for any reason.
-            try:
-                uploaded_file = Image.open(path)
-                message_parts = [F1_PROMPT, uploaded_file]
-            except Exception:
-                uploaded_file = client.files.upload(file=path)
-                message_parts = [F1_PROMPT, uploaded_file]
-
-            processing_step = "UPLOADED"
-            time.sleep(0.5)  # hold "Uploaded" for exactly 0.5s per spec
-
-            response_wait_start = time.time()
-            processing_step = "WAITING"
-            response = chat_session.send_message(message_parts)
-
-            response_holder.append(response.text)
-
-        except Exception as e:
-            response_holder.append(f"Net Error: {e}")
-
+            parts = [F1_PROMPT, Image.open(path)]
+        except Exception:
+            parts = [F1_PROMPT, client.files.upload(file=path)]
+        ch.step = "UPLOADED"
+        time.sleep(0.5)
     else:
-        try:
-            if chat_session is None:
-                chat_session = client.chats.create(model=MODEL_NAME)
+        parts = [text]
 
-            response_wait_start = time.time()
-            processing_step = "WAITING"
-            response = chat_session.send_message(current_input)
+    ch.wait_start = time.time()
+    ch.step = "WAITING"
+    return ch.session.send_message(parts).text
 
-            processing_step = "SENT"
-            time.sleep(0.5)
 
-            response_holder.append(response.text)
-        except Exception as e:
-            response_holder.append(f"Net Error: {e}")
+def _openai_request(ch, is_f1, path, text):
+    if OpenAI is None:
+        raise RuntimeError("openai package not installed")
+    if not OPENAI_API_KEY:
+        raise RuntimeError("No OpenAI key. Set OPENAI_API_KEY in %s" % ENV_FILE)
+    if ch.session is None:
+        ch.session = OpenAI(api_key=OPENAI_API_KEY)
+
+    if is_f1:
+        ch.step = "UPLOADING"
+        with open(path, "rb") as fh:
+            b64 = base64.b64encode(fh.read()).decode("ascii")
+        content = [
+            {"type": "input_text", "text": F1_PROMPT},
+            {"type": "input_image", "image_url": "data:image/jpeg;base64," + b64},
+        ]
+        ch.step = "UPLOADED"
+        time.sleep(0.5)
+    else:
+        content = [{"type": "input_text", "text": text}]
+
+    ch.wait_start = time.time()
+    ch.step = "WAITING"
+    kwargs = {
+        "model": OPENAI_MODEL_NAME,
+        "reasoning": {"effort": OPENAI_REASONING_EFFORT},
+        "input": [{"role": "user", "content": content}],
+    }
+    # Chain turns server-side so the photo is not re-uploaded every message.
+    if ch.prev_response_id:
+        kwargs["previous_response_id"] = ch.prev_response_id
+    response = ch.session.responses.create(**kwargs)
+    ch.prev_response_id = response.id
+    ch.last_usage = getattr(response, "usage", None)
+    return response.output_text
+
+
+REQUEST_FNS = {GEMINI: _gemini_request, OPENAI_CH: _openai_request}
+
+
+def _short_error(e):
+    """SDK errors carry a JSON blob and a URL; the deck has ~40 columns.
+    Pull the human-readable message out and keep it to one or two lines."""
+    text = str(e)
+    match = re.search(r"'message': ['\"](.+?)['\"](?:, ')", text)
+    msg = match.group(1) if match else text
+    msg = " ".join(msg.split())
+    if len(msg) > 68:
+        msg = msg[:65] + "..."
+    return "%s: %s" % (type(e).__name__.replace("Error", ""), msg)
+
+
+def _run_channel(ch):
+    """Worker body. Never touches curses -- only channel state."""
+    is_f1, path, text = ch.pending
+    try:
+        ch.answer = REQUEST_FNS[ch.key](ch, is_f1, path, text)
+        ch.status = "done"
+    except Exception as e:
+        ch.error = _short_error(e)
+        ch.status = "error"
+
+
+def launch_channel(ch, width):
+    """Start (or restart) one channel's request on its own thread."""
+    ch.status = "working"
+    ch.step = "UPLOADING" if ch.pending[0] else "WAITING"
+    ch.answer = None
+    ch.error = None
+    ch.awaiting_choice = False
+    ch.status_index = len(ch.history)
+    add_to_channel(ch, "[*] ...", width)
+    ch.thread = threading.Thread(target=_run_channel, args=(ch,), daemon=True)
+    ch.thread.start()
+
+
+def dispatch_capture(is_f1, path, text, width):
+    """Fire every enabled channel in parallel. Each gets its own turn."""
+    started = []
+    for key in (GEMINI, OPENAI_CH):
+        ch = channels[key]
+        if not ch.enabled:
+            continue
+        if ch.history:
+            add_to_channel(ch, " ", width)
+        if not is_f1:
+            add_to_channel(ch, f"> {text}", width, force_style=STYLES['user_input'])
+        ch.pending = (is_f1, path, text)
+        ch.retries = 0
+        ch.last_answer = None
+        launch_channel(ch, width)
+        started.append(ch)
+    return started
+
+
+def tick_channels(width):
+    """Advance throbbers and reap finished workers. Returns True if the screen
+    needs repainting. Called from the main loop, so curses stays single
+    threaded."""
+    global throbber_frame, throbber_tick
+    dirty = False
+
+    throbber_tick += 1
+    if throbber_tick % THROBBER_TICKS_PER_FRAME == 0:
+        throbber_frame = (throbber_frame + 1) % len(THROBBER_FRAMES)
+
+    for key in (GEMINI, OPENAI_CH):
+        ch = channels[key]
+
+        if ch.status == "working" and ch.status_index is not None:
+            if ch.status_index < len(ch.history):
+                ch.history[ch.status_index] = [
+                    (format_channel_status(ch) + THROBBER_FRAMES[throbber_frame],
+                     STYLES['status_text'])]
+            # Only repaint on a frame boundary; the loop ticks at 20Hz and a
+            # full clear/redraw every tick is wasteful on a Pi Zero.
+            if throbber_tick % THROBBER_TICKS_PER_FRAME == 0:
+                dirty = True
+
+        if ch.status in ("done", "error") and not ch.busy:
+            dirty = True
+            if ch.status_index is not None and ch.status_index < len(ch.history):
+                ch.history.pop(ch.status_index)
+            ch.status_index = None
+            ch.thread = None
+
+            if ch.status == "done":
+                ch.last_answer = extract_final_answer(ch.answer)
+                add_to_channel(ch, f"{ch.label}: {ch.answer}", width)
+                ch.status = "idle"
+            else:
+                _handle_channel_error(ch, width)
+
+    if dirty:
+        refresh_model_header()
+    return dirty
+
+
+def _handle_channel_error(ch, width):
+    """One silent retry, then hand the decision to the user. The other model
+    is flagged either way so a failure is visible without switching views."""
+    peer = other_channel(ch)
+
+    if ch.retries < AUTO_RETRY_LIMIT:
+        ch.retries += 1
+        add_to_channel(ch, f"[!] {ch.label} failed: {ch.error}", width,
+                       force_style=STYLES['diag_crit'])
+        add_to_channel(ch, f"[*] Retrying {ch.label} ({ch.retries}/{AUTO_RETRY_LIMIT})",
+                       width, force_style=STYLES['diag_warn'])
+        add_to_channel(peer, f"[!] {ch.label} failed, retrying", width,
+                       force_style=STYLES['diag_warn'])
+        launch_channel(ch, width)
+        return
+
+    ch.status = "error"
+    ch.awaiting_choice = True
+    add_to_channel(ch, f"[!] {ch.label} failed: {ch.error}", width,
+                   force_style=STYLES['diag_crit'])
+    add_to_channel(ch, "[?] Enter=retry  F3=stop model", width,
+                   force_style=STYLES['diag_ok'])
+    add_to_channel(peer, f"[!] {ch.label} failed - SYM+F2", width,
+                   force_style=STYLES['diag_crit'])
+
+
+def get_model_header_segments():
+    """Second header row: which model you are looking at, and how the other
+    one is doing, so a failure is visible without switching."""
+    normal = STYLES['normal']
+    segs = []
+    for i, key in enumerate((GEMINI, OPENAI_CH)):
+        ch = channels[key]
+        if i:
+            segs.append(("  ", normal))
+        is_active = (key == active_channel)
+        segs.append((f"[{ch.label}] " if is_active else f" {ch.label}  ",
+                     (STYLES.get('mode_num', normal) | curses.A_BOLD) if is_active
+                     else STYLES.get('hint', normal)))
+        if not ch.enabled:
+            segs.append(("off", STYLES.get('hint', normal)))
+        elif ch.status == "working":
+            segs.append(("...", STYLES['diag_warn']))
+        elif ch.awaiting_choice or ch.status == "error":
+            segs.append(("ERR", STYLES['diag_crit']))
+        else:
+            segs.append(("ok", STYLES['diag_ok']))
+    if answers_disagree():
+        segs.append(("  DIFF", STYLES['diag_crit'] | curses.A_BOLD))
+    return segs
+
+
+def refresh_model_header():
+    with redraw_lock:
+        if len(header_lines) > 1:
+            header_lines[1] = get_model_header_segments()
+
+
+def compare_answers(width):
+    """The optional third call. Asks OpenAI whether the two answers agree."""
+    g, o = channels[GEMINI], channels[OPENAI_CH]
+    if not g.answer or not o.answer:
+        return "[!] Need an answer from both models first."
+    if OpenAI is None or not OPENAI_API_KEY:
+        return "[!] No OpenAI key -- cannot compare."
+
+    prompt = (
+        "Two models answered the same engineering question. Say whether they "
+        "reach the same final answer. Reply with AGREE or DISAGREE on the "
+        "first line, then one short sentence naming the difference if any.\n\n"
+        "ANSWER A (Gemini):\n%s\n\nANSWER B (GPT):\n%s" % (g.answer, o.answer)
+    )
+    try:
+        c = OpenAI(api_key=OPENAI_API_KEY)
+        r = c.responses.create(
+            model=OPENAI_MODEL_NAME,
+            reasoning={"effort": OPENAI_REASONING_EFFORT},
+            input=prompt)
+        return "Compare: " + r.output_text.strip()
+    except Exception as e:
+        return "[!] Compare failed: %s: %s" % (type(e).__name__, str(e)[:120])
 
 
 def wait_for_network(stdscr):
@@ -1111,7 +1424,7 @@ def main(stdscr):
         pass
 
     header_lines.append(get_diagnostics_styled())
-    header_lines.append([("", STYLES['normal'])])
+    header_lines.append(get_model_header_segments())
 
     # Scrollable hint line printed into chat history after dismissing splash.
     add_splash_hint_line()
@@ -1145,6 +1458,8 @@ def main(stdscr):
         except Exception:
             key = -1
         if key == -1:
+            if tick_channels(width):
+                draw_screen(stdscr, current_input)
             continue
         needs_redraw = True
 
@@ -1173,6 +1488,61 @@ def main(stdscr):
                 continue
             else:
                 continue
+
+        # --- RETRY / GIVE UP PROMPT (visible channel only) ---
+        active = channels[active_channel]
+        if active.awaiting_choice and key in (curses.KEY_ENTER, 10, curses.KEY_F3):
+            if key == curses.KEY_F3:
+                active.awaiting_choice = False
+                active.enabled = False
+                active.status = "disabled"
+                peer = other_channel(active)
+                add_to_channel(active, f"[*] {active.label} off (SYM+F3 on)",
+                               width, force_style=STYLES['hint'])
+                add_to_channel(peer, f"[*] {active.label} off - {peer.label} only",
+                               width, force_style=STYLES['hint'])
+                if peer.enabled:
+                    switch_channel(peer.key)
+            else:
+                active.awaiting_choice = False
+                active.retries = 0
+                add_to_channel(active, f"[*] Retrying {active.label}", width,
+                               force_style=STYLES['diag_warn'])
+                launch_channel(active, width)
+            refresh_model_header()
+            chat_area_height = height - len(header_lines) - 1
+            scroll_offset = max(0, len(chat_history) - chat_area_height)
+            force_redraw = True
+            continue
+
+        # --- SYM + F-KEY COMBOS ---
+        # F4 is the SYM toggle itself, so SYM+F4 can never be pressed.
+        if sym_active and key in (curses.KEY_F1, curses.KEY_F2,
+                                  curses.KEY_F3, curses.KEY_F5):
+            sym_active = False
+            if key == curses.KEY_F1:
+                toggle_viewfinder(width)
+            elif key == curses.KEY_F2:
+                switch_channel()
+            elif key == curses.KEY_F3:
+                off = [channels[k] for k in (GEMINI, OPENAI_CH)
+                       if not channels[k].enabled]
+                if not off:
+                    add_to_channel(active, "[*] Both models already on", width,
+                                   force_style=STYLES['hint'])
+                else:
+                    for ch in off:
+                        ch.enabled = True
+                        ch.status = "idle"
+                        add_to_channel(ch, f"[*] {ch.label} back on", width,
+                                       force_style=STYLES['diag_ok'])
+            elif key == curses.KEY_F5:
+                add_to_channel(active, compare_answers(width), width)
+            refresh_model_header()
+            chat_area_height = height - len(header_lines) - 1
+            scroll_offset = max(0, len(chat_history) - chat_area_height)
+            force_redraw = True
+            continue
 
         if key == curses.KEY_UP:
             scroll_offset -= SCROLL_JUMP
@@ -1211,63 +1581,44 @@ def main(stdscr):
                 chat_area_height = height - len(header_lines) - 1
                 scroll_offset = max(0, len(chat_history) - chat_area_height)
 
-        # --- SYM+F1: TOGGLE VIEWFINDER ---
-        # Must precede the plain-F1 execute branch below.
-        elif key == curses.KEY_F1 and sym_active:
-            sym_active = False
-            toggle_viewfinder(width)
-            chat_area_height = height - len(header_lines) - 1
-            scroll_offset = max(0, len(chat_history) - chat_area_height)
-            force_redraw = True
-
-        # --- EXECUTE (F1 or Enter) ---
+        # --- EXECUTE (F1 or Enter): fire every enabled model in parallel ---
         elif key == curses.KEY_F1 or (key == curses.KEY_ENTER or key == 10):
             is_f1_press = (key == curses.KEY_F1)
             if not is_f1_press and not current_input:
                 continue
+            if any(channels[k].status == "working" for k in (GEMINI, OPENAI_CH)):
+                continue
+            if not any(channels[k].enabled for k in (GEMINI, OPENAI_CH)):
+                parse_and_add_history("[!] No models on (SYM+F3)", width,
+                                      force_style=STYLES['diag_crit'])
+                current_input = ""
+                continue
 
-            if chat_history:
-                parse_and_add_history(" ", width)
-
-            if not is_f1_press:
-                parse_and_add_history(f"> {current_input}", width, force_style=STYLES['user_input'])
-
-            parse_and_add_history("[*] ...", width)
-            chat_area_height = height - len(header_lines) - 1
-            scroll_offset = max(0, len(chat_history) - chat_area_height)
-            draw_screen(stdscr, current_input)
-
-            response_holder.clear()
-            processing_step = "..."
-            response_wait_start = 0.0  # reset stopwatch per spec
-
-            worker = threading.Thread(target=processing_task, args=(is_f1_press, current_input))
-            worker.start()
-
-            # Decoupled throbber: redraw every tick (so the stopwatch updates
-            # smoothly during WAITING), but advance the . . . frame only every
-            # THROBBER_TICKS_PER_FRAME ticks -- giving a constant dot cadence
-            # regardless of which state we're in.
-            animation_frames = ['   ', '.  ', '.. ', '...']
-            tick_count = 0
-            frame_index = 0
-            while worker.is_alive():
-                if tick_count % THROBBER_TICKS_PER_FRAME == 0:
-                    frame_index = (frame_index + 1) % len(animation_frames)
-                status_text = format_status()
-                chat_history[-1] = [(status_text + animation_frames[frame_index], STYLES['status_text'])]
+            path = "/tmp/capture.jpg"
+            if is_f1_press:
+                # The camera is exclusive: the viewfinder must let go first.
+                if stop_viewfinder():
+                    force_redraw = True
+                for k in (GEMINI, OPENAI_CH):
+                    channels[k].step = "CAPTURING"
+                refresh_model_header()
                 draw_screen(stdscr, current_input)
-                time.sleep(THROBBER_TICK_SEC)
-                tick_count += 1
+                cmd = ["rpicam-still", "-o", path, "-t", "100",
+                       "--width", "2592", "--height", "1944",
+                       "--exposure", "sport", "-q", "95", "-n", "--immediate"]
+                result = subprocess.run(cmd, capture_output=True, text=True)
+                if result.returncode != 0 or not os.path.exists(path):
+                    tail = result.stderr.strip().split("\n")[-1][:30] if result.stderr else "unknown"
+                    parse_and_add_history(f"Cam Fail: {tail}...", width,
+                                          force_style=STYLES['diag_crit'])
+                    scroll_offset = max(0, len(chat_history) - chat_area_height)
+                    continue
 
-            chat_history.pop()
-
-            if response_holder:
-                parse_and_add_history(f"Model: {response_holder[0]}", width)
-            else:
-                parse_and_add_history("Error: No response from thread.", width)
-
+            # One photo, one turn appended to each model's own conversation.
+            dispatch_capture(is_f1_press, path, current_input, width)
+            refresh_model_header()
             current_input = ""
+            chat_area_height = height - len(header_lines) - 1
             scroll_offset = max(0, len(chat_history) - chat_area_height)
 
         # Character input through mode mapping

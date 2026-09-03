@@ -29,6 +29,9 @@ Headless Sway (Wayland) -> wayvnc -> cgvm_vnc bridge -> USB -> Calculator Screen
 ## Controls
 - **F1:** Capture photo and send to AI for analysis
 - **SYM+F1:** Toggle viewfinder (camera preview)
+- **SYM+F2:** Switch between the Gemini and OpenAI views
+- **SYM+F3:** Re-enable a model you stopped after a failure
+- **SYM+F5:** Ask OpenAI whether the two answers agree
 - **F2:** Toggle the splashscreen (controls + keyboard map)
 - **F3:** Clear input buffer
 - **F4:** Toggle SHIFT mode (symbols)
@@ -2330,3 +2333,69 @@ splice the real key back in.
   created, and no `AIza` literal remains anywhere in `/root/casio_ai.py`.
 - Live round-trip against `gemini-3.1-pro-preview` returned a response with the
   key sourced from the env file.
+
+## 2026-09-03 - Second Model Alongside Gemini
+
+### Context
+Every captured photo now goes to two models so the answers can be cross-checked.
+Gemini's integration is unchanged. The second is OpenAI `gpt-5.6-sol` at
+`reasoning.effort: "max"`.
+
+`gpt-5.6-sol-max` is **not** a model id -- `models.list` shows only
+`gpt-5.6-luna`, `gpt-5.6-sol`, and `gpt-5.6-terra`. "Sol Max" is `gpt-5.6-sol`
+with the effort dialled to `max`.
+
+### Architecture
+The old request path fired one worker and then blocked in a throbber loop until
+it returned, which made "look at whichever model answers first" impossible.
+Requests are now non-blocking:
+
+- A `Channel` object per model holds its own history, scroll offset, status,
+  session, and pending request. The two conversations are never merged.
+- `chat_history` is now an alias for the active channel's list, so every
+  existing helper that appends to it keeps working untouched.
+- `dispatch_capture()` appends a turn to each enabled channel and starts both
+  workers at once. `tick_channels()` runs from the main loop, advancing the
+  throbbers and reaping finished workers, so curses stays single-threaded and
+  keys still register while a request is in flight.
+- Gemini keeps its `chats` session; OpenAI chains turns with
+  `previous_response_id` so the photo is not re-uploaded on follow-ups.
+
+### Failure Handling
+One silent retry, then the deck asks. The failing model's view shows
+`Enter=retry  F3=stop model`; stopping it sets `enabled = False` so captures
+run single-model until SYM+F3 turns it back on. Either way the *other* view is
+flagged, so a failure is visible without switching. SDK errors are run through
+`_short_error()`, which digs the human-readable message out of the JSON blob
+and truncates it -- the raw text wrapped to four lines on a 40-column screen.
+
+### Disagreement
+`extract_final_answer()` takes the last number in each response and the header
+shows `DIFF` when they differ beyond a relative 1e-6. It is deliberately crude
+and does nothing when either response has no number in it. SYM+F5 runs the
+optional third call, asking OpenAI to compare the two answers directly.
+
+### Verification
+Tested against the live APIs on the Pi:
+- Both models answered `17*23` with `391`, in parallel -- Gemini at 2.4s,
+  8.5s wall clock for both.
+- Real photo through both: 943KB capture, 18.6s wall clock, both models
+  independently reported the frame was too dark and returned the prompt's
+  failure format.
+- Broken OpenAI key: Gemini answered normally and showed
+  `[!] OPENAI failed, retrying`, OpenAI auto-retried once then offered the
+  stop/retry choice. Disabling it left Gemini running alone.
+- Header renders `[GEMINI] ok   OPENAI  ...` / `off` / `ERR` as expected.
+
+### Cost
+One photo at `effort: max`: 7029 input + 357 output tokens (239 reasoning) =
+**$0.035**, about 425 photos per $15. That measurement is a floor, not a
+typical figure -- the image was unreadable, so the model gave up early and
+barely reasoned. A real worksheet will spend far more reasoning tokens, which
+bill as output at $20/M. Measure again on real problems before extrapolating.
+
+### Known Gap
+`send_class_context()` still loads class notes into Gemini's session only, so
+with a class context active the two models are not working from identical
+context. It also still uses the old blocking request path. Worth resolving
+alongside the notes rework.

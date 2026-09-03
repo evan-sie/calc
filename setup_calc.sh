@@ -6,7 +6,7 @@ echo "Step 2: Install Python packages"
 # Alternatively, we could create a venv, but the user said "Prefer apt packages where available... but make Python imports work".
 # We already installed python3-pil, python3-opencv, python3-numpy via apt.
 # google-genai is not in apt, so we use pip.
-pip3 install --break-system-packages google-genai
+pip3 install --break-system-packages google-genai openai
 
 echo "Step 3: Clone repo"
 rm -rf /root/calc
