@@ -41,11 +41,23 @@ systemctl daemon-reload
 systemctl enable cyberdeck.service wifi-ensure.service
 ```
 
-## API Key
+## API Keys
 
-`casio_ai.py` in this repo has `API_KEY = "---"` as a placeholder. The real
-Gemini key is never committed. After copying the file into place, edit
-`/root/casio_ai.py` and set `API_KEY` to the live key.
+Keys are not in the source and never committed. `casio_ai.py` reads them from
+`/root/.casio_ai.env`, which you must create by hand after a restore:
+
+```bash
+cat > /root/.casio_ai.env <<'EOF'
+# API keys for casio_ai.py. Never commit this file.
+GEMINI_API_KEY=your-gemini-key-here
+OPENAI_API_KEY=your-openai-key-here
+EOF
+chmod 600 /root/.casio_ai.env
+```
+
+A real environment variable of the same name takes precedence over the file.
+If a key is missing, the deck still starts and says so in the chat rather than
+failing silently.
 
 ## Class Notes
 

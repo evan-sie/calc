@@ -1,3 +1,8 @@
+# API keys. These live outside the repo (see RESTORE.md); these patterns are
+# a backstop in case one is ever copied into the working tree.
+.casio_ai.env
+*.env
+
 # Local shell/session artifacts
 .bash_history
 .bashrc

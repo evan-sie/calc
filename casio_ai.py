@@ -12,7 +12,32 @@ import textwrap
 import cv2
 
 # --- USER CONFIGURATION ---
-API_KEY = "---"
+# API keys live outside the repo so they are never committed. See RESTORE.md.
+ENV_FILE = "/root/.casio_ai.env"
+
+
+def load_env_file(path=ENV_FILE):
+    """Read KEY=VALUE lines from path into os.environ.
+
+    A real environment variable always wins, so the deck can be run with keys
+    injected some other way. Missing or unreadable file is not fatal -- the
+    resulting empty key produces an explicit message in the chat instead."""
+    try:
+        with open(path) as fh:
+            for line in fh:
+                line = line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                key, value = line.split("=", 1)
+                os.environ.setdefault(key.strip(), value.strip().strip("\"'"))
+    except OSError:
+        pass
+
+
+load_env_file()
+
+API_KEY = os.environ.get("GEMINI_API_KEY", "")
+OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
 MODEL_NAME = "gemini-3.1-pro-preview"
 
 # Viewfinder (SYM+F1). Capture stops it -- the camera is exclusive.
@@ -194,11 +219,12 @@ STYLES = {}
 
 # Chat session for memory
 chat_session = None
+client = None
 try:
     client = genai.Client(api_key=API_KEY)
     chat_session = client.chats.create(model=MODEL_NAME)
-except:
-    pass
+except Exception:
+    client = None
 
 # --- GLOBAL STATE ---
 header_lines = []
@@ -734,6 +760,10 @@ Respond with this confirmation line once you have understood and digested the co
     def _worker():
         global chat_session, processing_step, response_wait_start, response_holder
         try:
+            if client is None:
+                response_holder.append(
+                    "No Gemini key. Set GEMINI_API_KEY in %s" % ENV_FILE)
+                return
             if chat_session is None:
                 chat_session = client.chats.create(model=MODEL_NAME)
             response_wait_start = time.time()
@@ -925,6 +955,10 @@ def processing_task(is_f1, current_input=None):
 
         processing_step = "UPLOADING"
         try:
+            if client is None:
+                response_holder.append(
+                    "No Gemini key. Set GEMINI_API_KEY in %s" % ENV_FILE)
+                return
             if chat_session is None:
                 chat_session = client.chats.create(model=MODEL_NAME)
 

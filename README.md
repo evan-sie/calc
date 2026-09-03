@@ -2292,3 +2292,41 @@ The overlay covers the entire 396x224 screen, so the toolbar and its SYM
 indicator are hidden while the viewfinder is up. Closing it is still SYM+F1,
 pressed blind. `no_focus [app_id="mpv"]` is what makes this work at all -- the
 terminal keeps keyboard focus the whole time.
+
+If this becomes annoying, the overlay geometry is a single constant
+(`VF_GEOMETRY`) -- shrinking it to something like `396x200+0+0` would leave the
+toolbar row visible underneath while framing. Not done, noted as an option.
+
+
+## 2026-09-03 - API Keys Moved Out of Source
+
+### Context
+`API_KEY` was a string literal at the top of `casio_ai.py`. That meant every
+commit had to be scrubbed by hand, and the repo's history already carries one
+leaked key from before this practice started. With a second provider about to
+be added, the config block was going to hold two secrets instead of one.
+
+### Changes Made
+- **`casio_ai.py`** - Added `load_env_file()`, which reads `KEY=VALUE` lines
+  from `/root/.casio_ai.env` into `os.environ` via `setdefault`, so a real
+  environment variable always wins. `API_KEY` now comes from `GEMINI_API_KEY`,
+  and `OPENAI_API_KEY` is read alongside it for the upcoming second model.
+- `client` is explicitly initialised to `None` and the bare `except:` around
+  the `genai.Client` construction narrowed to `except Exception:`. Both request
+  paths now check `client is None` and report `No Gemini key. Set
+  GEMINI_API_KEY in /root/.casio_ai.env` rather than surfacing a NameError
+  through the generic `Net Error:` handler.
+- **`.gitignore`** - Added `.casio_ai.env` and `*.env` as a backstop.
+- **`RESTORE.md`** - Documents creating the env file at mode 600.
+
+### Migration
+The live key was moved from `/root/casio_ai.py` into `/root/.casio_ai.env`
+(mode 600) on the Pi. The repo copy and the deck copy of `casio_ai.py` are now
+byte-identical, which they never were before -- previously every deploy had to
+splice the real key back in.
+
+### Verification
+- `A.API_KEY` non-empty (39 chars), `A.client` constructed, `A.chat_session`
+  created, and no `AIza` literal remains anywhere in `/root/casio_ai.py`.
+- Live round-trip against `gemini-3.1-pro-preview` returned a response with the
+  key sourced from the env file.
