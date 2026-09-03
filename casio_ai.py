@@ -290,8 +290,10 @@ class Channel:
         self.status_index = None
         self.last_answer = None   # extracted final number, for the DIFF marker
         self.last_usage = None    # token usage of the last call, if reported
-        self.thought = ""         # streamed reasoning summary
+        self.thought = ""         # streamed reasoning summary, prose included
         self.thought_label = ""   # newest **header** from it, for the status line
+        self.thought_headers = [] # every **header**, kept after the prose goes
+        self.live_len = 0         # lines the in-flight block currently occupies
         self.enabled = True
 
     @property
@@ -435,21 +437,30 @@ def get_diagnostics_styled():
                 else:
                     dbm_style = crit
                 segments.extend([(f" {ssid} ", normal), (str(signal_dbm), dbm_style)])
+            else:
+                segments.extend([(" ", normal), ("NOWIFI", crit)])
         except (subprocess.CalledProcessError, FileNotFoundError):
             segments.extend([(" ", normal), ("NOWIFI", crit)])
 
-        # Active model, coloured by its health: green ok, red failed or off,
-        # amber while a request is in flight.
-        ch = channels[active_channel]
-        if not ch.enabled or ch.awaiting_choice or ch.status == "error":
-            model_style = crit
-        elif ch.status == "working":
-            model_style = warn
-        else:
-            model_style = ok
-        segments.extend([(" ", normal), (ch.label, model_style | curses.A_BOLD)])
+        # Both models, each coloured by its own health: green ok, red failed
+        # or off, amber mid-request. The displayed one is bold.
+        for key in (GEMINI, OPENAI_CH):
+            ch = channels[key]
+            if not ch.enabled or ch.awaiting_choice or ch.status == "error":
+                model_style = crit
+            elif ch.status == "working":
+                model_style = warn
+            else:
+                model_style = ok
+            if key == active_channel:
+                model_style |= curses.A_BOLD
+            segments.extend([(" ", normal), (ch.label, model_style)])
+
         if answers_disagree():
             segments.append((" DIFF", crit | curses.A_BOLD))
+
+        # RTC in military time (HH:MM local).
+        segments.extend([(" ", normal), (time.strftime("%H:%M"), normal | curses.A_BOLD)])
 
         return segments
     except Exception:
@@ -1061,12 +1072,13 @@ def note_thought(ch, text):
     if not text:
         return
     ch.thought += text
-    headers = _THOUGHT_HEADER_RE.findall(ch.thought)
-    if headers:
-        label = headers[-1]
-    else:
-        label = " ".join(ch.thought.split())[-32:]
-    ch.thought_label = " ".join(label.split())[:32]
+    headers = [" ".join(h.split()) for h in _THOUGHT_HEADER_RE.findall(ch.thought)]
+    # Keep the running list of steps; it is what survives once the prose goes.
+    for h in headers:
+        if h and (not ch.thought_headers or ch.thought_headers[-1] != h):
+            ch.thought_headers.append(h)
+    label = ch.thought_headers[-1] if ch.thought_headers else " ".join(ch.thought.split())[-32:]
+    ch.thought_label = label[:32]
 
 
 def _gemini_request(ch, is_f1, path, text):
@@ -1128,7 +1140,11 @@ def _openai_request(ch, is_f1, path, text):
     ch.step = "WAITING"
     kwargs = {
         "model": OPENAI_MODEL_NAME,
-        "reasoning": {"effort": OPENAI_REASONING_EFFORT, "summary": "auto"},
+        # "auto" silently returned no summary at all on image requests -- the model
+        # reasoned for hundreds of tokens and reported none of it. "detailed"
+        # asks explicitly, and still stays quiet when there is nothing to think
+        # about, which is the behaviour we want.
+        "reasoning": {"effort": OPENAI_REASONING_EFFORT, "summary": "detailed"},
         "input": [{"role": "user", "content": content}],
         "stream": True,
     }
@@ -1177,6 +1193,36 @@ def _run_channel(ch):
         ch.status = "error"
 
 
+THOUGHT_PROSE_LINES = 4
+
+
+def thought_prose_lines(ch, width):
+    """Tail of the raw reasoning prose, headers stripped out. Shown only while
+    the request is in flight; the headers are what remain afterwards."""
+    text = _THOUGHT_HEADER_RE.sub(" ", ch.thought)
+    text = " ".join(text.split())
+    if not text:
+        return []
+    return textwrap.wrap(text, max(12, width - 1))[-THOUGHT_PROSE_LINES:]
+
+
+def render_live_block(ch, width):
+    block = [[(format_channel_status(ch) + THROBBER_FRAMES[throbber_frame],
+               STYLES['status_text'])]]
+    for line in thought_prose_lines(ch, width):
+        block.append([(line, STYLES['hint'])])
+    return block
+
+
+def replace_live_block(ch, new_lines):
+    """Swap the in-flight block for something else, tracking its length so a
+    later swap cannot eat messages appended after it."""
+    if ch.status_index is None:
+        return
+    ch.history[ch.status_index:ch.status_index + ch.live_len] = new_lines
+    ch.live_len = len(new_lines)
+
+
 def launch_channel(ch, width):
     """Start (or restart) one channel's request on its own thread."""
     ch.status = "working"
@@ -1185,9 +1231,11 @@ def launch_channel(ch, width):
     ch.error = None
     ch.thought = ""
     ch.thought_label = ""
+    ch.thought_headers = []
     ch.awaiting_choice = False
     ch.status_index = len(ch.history)
-    add_to_channel(ch, "[*] ...", width)
+    ch.live_len = 0
+    replace_live_block(ch, [[("[*] ...", STYLES['status_text'])]])
     ch.thread = threading.Thread(target=_run_channel, args=(ch,), daemon=True)
     ch.thread.start()
 
@@ -1226,10 +1274,7 @@ def tick_channels(width):
         ch = channels[key]
 
         if ch.status == "working" and ch.status_index is not None:
-            if ch.status_index < len(ch.history):
-                ch.history[ch.status_index] = [
-                    (format_channel_status(ch) + THROBBER_FRAMES[throbber_frame],
-                     STYLES['status_text'])]
+            replace_live_block(ch, render_live_block(ch, width))
             # Only repaint on a frame boundary; the loop ticks at 20Hz and a
             # full clear/redraw every tick is wasteful on a Pi Zero.
             if throbber_tick % THROBBER_TICKS_PER_FRAME == 0:
@@ -1237,9 +1282,9 @@ def tick_channels(width):
 
         if ch.status in ("done", "error") and not ch.busy:
             dirty = True
-            if ch.status_index is not None and ch.status_index < len(ch.history):
-                ch.history.pop(ch.status_index)
+            replace_live_block(ch, [[(h, STYLES['bold'])] for h in ch.thought_headers])
             ch.status_index = None
+            ch.live_len = 0
             ch.thread = None
 
             if ch.status == "done":
@@ -1449,6 +1494,10 @@ def main(stdscr):
             key = -1
         if key == -1:
             if tick_channels(width):
+                chat_area_height = height - len(header_lines) - 1
+                max_scroll = max(0, len(chat_history) - chat_area_height)
+                if scroll_offset >= max_scroll - SCROLL_JUMP:
+                    scroll_offset = max_scroll
                 draw_screen(stdscr, current_input)
             continue
         needs_redraw = True

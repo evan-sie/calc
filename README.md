@@ -2526,3 +2526,59 @@ one rather than whatever it was last time.
   seconds`, both with live thought labels (8 and 12 distinct labels).
 - OpenAI chaining id and usage still captured through the streaming path.
 - Splash reports `IP      192.168.50.125`.
+
+## 2026-09-03 - Toolbar Rework, Thought Prose, and the Missing GPT Summary
+
+### Toolbar
+Clock restored on the end, and both models are shown rather than just the
+active one, each coloured by its own health with the displayed one in bold:
+
+```
+[123] 38C 176/354 Rawon -67 GEMINI GPT 01:36
+```
+
+Showing both means a failure on the model you are *not* looking at is visible
+on the bar as well as in the chat.
+
+Also fixed a gap this surfaced: when `iwgetid` returned an empty SSID without
+raising -- which happens when the link drops rather than the command failing --
+the WiFi section rendered nothing at all. It now says `NOWIFI` in red for both
+the empty and the exception case.
+
+### Thought Prose
+While a request is in flight the status line shows the current `**header**` and
+the raw reasoning prose streams beneath it, wrapped, last 4 lines only. When
+the request completes the prose is discarded and only the bold step headers
+remain above the answer, as a compact trace of how the model got there.
+
+The in-flight region is tracked as a block (`status_index` + `live_len`) and
+replaced wholesale each tick, so a message appended after it cannot be eaten
+when the block is swapped out.
+
+The chat follows the bottom while the block grows, but only if the reader was
+already at the bottom -- scrolling back to re-read something no longer yanks
+you forward.
+
+### The GPT "thinking" Status Was Not Broken
+Reported as GPT only ever showing `GPT thinking...` on captures. Measured on
+the same downscaled image:
+
+| `reasoning.summary` | summary chars | reasoning tokens |
+|---|---|---|
+| `auto` | 0 | 381 |
+| `detailed` | 472 | 223 |
+
+So the model *was* reasoning and the API was returning none of it. `auto` lets
+the provider decide whether to summarise, and on image requests it declined
+every time while still summarising text requests. Now set to `detailed`, which
+asks explicitly and still stays quiet when there is genuinely nothing to think
+about.
+
+Gemini has no equivalent knob -- `include_thoughts` is a boolean -- and its
+summaries do vary run to run on easy questions. Nothing to tune there.
+
+### Note
+One test run failed with `Temporary failure in name resolution` when the 2.4GHz
+link dropped mid-request. Unplanned, but it exercised the retry path in the
+wild: both models reported the failure, auto-retried, and offered the
+retry/stop choice.
