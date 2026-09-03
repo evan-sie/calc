@@ -28,12 +28,13 @@ Headless Sway (Wayland) -> wayvnc -> cgvm_vnc bridge -> USB -> Calculator Screen
 
 ## Controls
 - **F1:** Capture photo and send to AI for analysis
-- **F2:** Toggle viewfinder (camera preview)
+- **SYM+F1:** Toggle viewfinder (camera preview)
+- **F2:** Toggle the splashscreen (controls + keyboard map)
+- **F3:** Clear input buffer
 - **F4:** Toggle SHIFT mode (symbols)
 - **F5:** Toggle NUM/ALPHA mode (numbers vs letters)
 - **F6:** Restart the AI interface
 - **Enter:** Send text query to AI
-- **Escape:** Clear input buffer
 - **Up/Down:** Scroll chat history
 
 ## Keyboard Modes
@@ -2238,3 +2239,56 @@ echo "America/Chicago" > /etc/timezone
 - Rewrote `render_splash_line` in `casio_ai.py` to process inline color markers (`[[G]]...[[/G]]` and `[[R]]...[[/R]]`) in the rest-of-line portion regardless of whether the line begins with a recognized leading key token.
 - Replaced "Esc" reference in splash screen with "F3" to match the actual key handler for clearing the input buffer.
 - Swapped the capture upload logic in `processing_task` so that `Image.open(path)` is the primary path and `client.files.upload(file=path)` is the fallback, ensuring captured images are visible as inline base64 data in API logs.
+
+## 2026-09-03 - Viewfinder Re-added on SYM+F1
+
+### Context
+The viewfinder was lost at some point before this repo existed -- `start_viewfinder`
+appears in no commit, and the only surviving copy of the old implementation was
+the description in this README. The sway-side plumbing had survived untouched:
+`for_window [app_id="mpv"] { floating enable; resize set 396 224 }`, `no_focus
+[app_id="mpv"]`, and `focus_follows_mouse no` were all still in place, and both
+`mpv` and `rpicam-vid` were still installed.
+
+All six F-keys were already bound (F1 capture, F2 splash, F3 clear, F4 SHIFT,
+F5 NUM/ALPHA, F6 restart), so the viewfinder could not simply reclaim its old
+F2 slot without displacing something.
+
+### Changes Made
+- **`casio_ai.py`** - Added `start_viewfinder()`, `stop_viewfinder()`,
+  `toggle_viewfinder()`, and a `_swaymsg()` helper. Bound to **SYM+F1**, which
+  consumes the sticky SYM the same way a mapped character does. Nothing else
+  was rebound; plain F1 still captures immediately.
+- The overlay pipeline is the one documented in the 2026-02-04 entries:
+  `rpicam-vid` MJPEG at 320x180/15fps piped to `mpv --vo=wlshm` with
+  `--profile=low-latency --untimed`, sized to the full 396x224 screen.
+- Sway draws fullscreen windows above floating ones, so `start_viewfinder()`
+  drops `foot` out of fullscreen and `stop_viewfinder()` puts it back.
+- `processing_task()` calls `stop_viewfinder()` before `rpicam-still`, since
+  `/dev/video0` is exclusive, and sets `force_redraw` so the chat underneath
+  repaints once the full-screen overlay is gone.
+- Teardown is SIGTERM to the process group, SIGKILL after 150ms if it is still
+  alive, then an unconditional `pkill` sweep for orphans and a 300ms wait for
+  the V4L2 device to be released.
+- The old autofocus machinery was **not** restored. The OV5647 is fixed-focus
+  at 7in with no AF motor, so `--autofocus-mode`, `--lens-position`, and the
+  `/dev/shm/af_meta.json` LensPosition bookkeeping no longer apply.
+
+### Verification
+Tested against the running stack on the Pi:
+- Overlay appears in the sway tree as `floating_con / app_id=mpv /
+  name=viewfinder / visible=True` at rect 396x224+0+0.
+- `foot` `fullscreen_mode` goes 1 -> 0 on start and 0 -> 1 on stop.
+- A double `start_viewfinder()` returns False rather than starting a second
+  pipeline; `stop_viewfinder()` on an idle viewfinder returns False.
+- After `stop_viewfinder()`, `rpicam-still` succeeds (rc 0, 877KB JPEG in
+  3.6s), confirming the camera is genuinely released.
+- Time to first visible frame: ~3s warm, ~8s on a cold camera. Tuning
+  `--demuxer-lavf-analyzeduration`/`--probesize`/`--cache=no` moved this by
+  only 0.2s, so the documented flags were kept as-is.
+
+### Known Rough Edge
+The overlay covers the entire 396x224 screen, so the toolbar and its SYM
+indicator are hidden while the viewfinder is up. Closing it is still SYM+F1,
+pressed blind. `no_focus [app_id="mpv"]` is what makes this work at all -- the
+terminal keeps keyboard focus the whole time.

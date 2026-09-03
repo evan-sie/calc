@@ -4,6 +4,7 @@ import subprocess
 import re
 import time
 import threading
+import signal
 from google import genai
 from PIL import Image
 import curses
@@ -13,6 +14,11 @@ import cv2
 # --- USER CONFIGURATION ---
 API_KEY = "---"
 MODEL_NAME = "gemini-3.1-pro-preview"
+
+# Viewfinder (SYM+F1). Capture stops it -- the camera is exclusive.
+VF_WIDTH, VF_HEIGHT, VF_FPS = 320, 180, 15
+VF_GEOMETRY = "396x224+0+0"
+VF_CAMERA_RELEASE_SEC = 0.3
 NOTES_DIR = os.path.expanduser("~/notes")
 
 F1_PROMPT = """<system_instruction>
@@ -211,6 +217,9 @@ pending_class_md = None
 # Keyboard mode state
 input_mode = NUM
 sym_active = False
+
+# Viewfinder overlay state
+viewfinder_process = None
 
 # Stats State
 last_net_stats = {'time': 0, 'rx': 0, 'tx': 0}
@@ -481,7 +490,7 @@ def render_splash_line(stdscr, y, block_x, w, line):
         cursor_x = block_x
         
         if gap > 0 and (stripped[:gap].startswith('F') or
-                        stripped[:gap] in ('Enter', 'Up/Down', 'Key', 'RSSI')):
+                        stripped[:gap] in ('Enter', 'Up/Down', 'Key', 'RSSI', 'SYM+F1')):
             key_part = stripped[:gap]
             rest_part = stripped[gap:]
             stdscr.addstr(y, cursor_x, " " * leading_ws, STYLES['normal'])
@@ -584,6 +593,7 @@ def show_splash_system(stdscr):
 def get_startup_splash_lines():
     return [
         "F1      Capture & analyze image",
+        "SYM+F1  Toggle camera viewfinder",
         "F2      Toggle this splashscreen",
         "F4      Toggle SHIFT  (SYM, 1-press)",
         "F5      Toggle NUM/ALPHA",
@@ -801,11 +811,105 @@ def format_status():
     return "[*] ..."
 
 
+def _swaymsg(*args):
+    """Fire a swaymsg command. Sway is the parent of this process, so SWAYSOCK
+    is inherited; failures are non-fatal because the viewfinder is optional."""
+    try:
+        subprocess.run(["swaymsg", *args], capture_output=True, text=True, timeout=2)
+    except (OSError, subprocess.SubprocessError):
+        pass
+
+
+def stop_viewfinder():
+    """Tear down the viewfinder and wait for /dev/video0 to be released.
+    Returns True if it had been running."""
+    global viewfinder_process
+
+    was_running = viewfinder_process is not None
+    if viewfinder_process:
+        try:
+            pgid = os.getpgid(viewfinder_process.pid)
+            os.killpg(pgid, signal.SIGTERM)
+            time.sleep(0.15)
+            if viewfinder_process.poll() is None:
+                os.killpg(pgid, signal.SIGKILL)
+        except (ProcessLookupError, OSError):
+            pass
+        viewfinder_process = None
+
+    # Always sweep for orphans -- a half-dead rpicam-vid keeps the camera.
+    for pattern in ("rpicam-vid", "mpv.*viewfinder"):
+        try:
+            subprocess.run(["pkill", "-9", "-f", pattern],
+                           capture_output=True, text=True, timeout=2)
+        except (OSError, subprocess.SubprocessError):
+            pass
+
+    if was_running:
+        # Sway draws fullscreen windows above floating ones, so the terminal
+        # is un-fullscreened while the overlay is up. Put it back.
+        _swaymsg('[app_id="foot"]', "fullscreen", "enable")
+        time.sleep(VF_CAMERA_RELEASE_SEC)
+
+    return was_running
+
+
+def start_viewfinder():
+    """Launch the rpicam-vid -> mpv overlay. Returns True on launch.
+
+    OV5647 is fixed-focus at 7in with no AF motor, so there is no autofocus
+    or lens-position handling here."""
+    global viewfinder_process
+
+    if viewfinder_process is not None:
+        return False
+
+    cmd = (
+        f"rpicam-vid -t 0 --width {VF_WIDTH} --height {VF_HEIGHT} "
+        f"--codec mjpeg --framerate {VF_FPS} -n -o - | "
+        "mpv --no-terminal --vo=wlshm --profile=low-latency "
+        "--demuxer=lavf --demuxer-lavf-format=mjpeg --untimed "
+        f"--title=viewfinder --geometry={VF_GEOMETRY} --no-border -"
+    )
+
+    # Drop fullscreen first, or the floating overlay renders behind the term.
+    _swaymsg('[app_id="foot"]', "fullscreen", "disable")
+
+    try:
+        viewfinder_process = subprocess.Popen(
+            cmd, shell=True, stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL, preexec_fn=os.setsid)
+    except (OSError, subprocess.SubprocessError):
+        viewfinder_process = None
+        _swaymsg('[app_id="foot"]', "fullscreen", "enable")
+        return False
+
+    return True
+
+
+def toggle_viewfinder(width):
+    """SYM+F1 handler. The same key closes it; so does an F1 capture."""
+    if viewfinder_process is None:
+        if start_viewfinder():
+            parse_and_add_history("[*] Viewfinder ON  (SYM+F1 to close)", width)
+        else:
+            parse_and_add_history("[!] Viewfinder failed to start", width)
+    else:
+        stop_viewfinder()
+        parse_and_add_history("[*] Viewfinder OFF", width)
+
+
 def processing_task(is_f1, current_input=None):
     global response_holder, processing_step, chat_session, response_wait_start
+    global force_redraw
 
     if is_f1:
         path = "/tmp/capture.jpg"
+
+        # The camera is exclusive: the viewfinder must let go before capture.
+        # The overlay covers the whole screen, so a teardown needs a repaint.
+        if stop_viewfinder():
+            force_redraw = True
 
         processing_step = "CAPTURING"
         # OV5647 fixed focus at 7in. No AF motor -- instant capture.
@@ -1065,12 +1169,22 @@ def main(stdscr):
         # --- F6: RESTART (press twice to confirm) ---
         elif key == curses.KEY_F6:
             if restart_confirm_active:
+                stop_viewfinder()
                 os.execl(sys.executable, sys.executable, *sys.argv)
             else:
                 restart_confirm_active = True
                 chat_history.append([("[!] Press F6 again to RESTART", STYLES['diag_crit'])])
                 chat_area_height = height - len(header_lines) - 1
                 scroll_offset = max(0, len(chat_history) - chat_area_height)
+
+        # --- SYM+F1: TOGGLE VIEWFINDER ---
+        # Must precede the plain-F1 execute branch below.
+        elif key == curses.KEY_F1 and sym_active:
+            sym_active = False
+            toggle_viewfinder(width)
+            chat_area_height = height - len(header_lines) - 1
+            scroll_offset = max(0, len(chat_history) - chat_area_height)
+            force_redraw = True
 
         # --- EXECUTE (F1 or Enter) ---
         elif key == curses.KEY_F1 or (key == curses.KEY_ENTER or key == 10):
