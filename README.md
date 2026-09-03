@@ -2582,3 +2582,35 @@ One test run failed with `Temporary failure in name resolution` when the 2.4GHz
 link dropped mid-request. Unplanned, but it exercised the retry path in the
 wild: both models reported the failure, auto-retried, and offered the
 retry/stop choice.
+
+## 2026-09-03 - Bold Fix and Back to In-Place Summary Headers
+
+### Bold Was Invisible on Green
+`initialize_theme` does `STYLES['diag_ok'] = STYLES['diag_ok'] | curses.A_BOLD`,
+so the healthy-green style is *already* bold. OR-ing `A_BOLD` onto the active
+model was therefore a no-op whenever both models were green, and the only
+reason it appeared to work was that `diag_warn` is not pre-bolded -- so bold
+showed up on amber and nowhere else.
+
+Fixed by clearing the bit explicitly on the inactive model
+(`model_style &= ~curses.A_BOLD`) rather than only setting it on the active
+one. Verified across both active states: exactly one model reports
+`A_BOLD` at a time, whatever the colours.
+
+### Thought Prose Reverted
+The streaming prose block was too noisy in practice. Back to a single line:
+the newest `**header**` sits where the status text goes, right after `[*]`,
+with the dots still animating, and each header replaces the last in place
+rather than accumulating. Nothing survives the request -- on completion the
+line is removed and only the answer remains.
+
+`render_live_block()` is now a one-liner and `thought_prose_lines()` is gone;
+the block mechanism stays, since swapping a tracked region is still what makes
+the line safe to replace and remove.
+
+### Verification
+Both checks run offline against stubbed styles, no API calls:
+- Toolbar: active model bold, inactive not, in both directions.
+- Thinking line: three successive headers each replaced the previous on a
+  single line with the throbber advancing; after completion the channel held
+  exactly one line, the answer.

@@ -454,6 +454,8 @@ def get_diagnostics_styled():
                 model_style = ok
             if key == active_channel:
                 model_style |= curses.A_BOLD
+            else:
+                model_style &= ~curses.A_BOLD
             segments.extend([(" ", normal), (ch.label, model_style)])
 
         if answers_disagree():
@@ -1193,25 +1195,12 @@ def _run_channel(ch):
         ch.status = "error"
 
 
-THOUGHT_PROSE_LINES = 4
-
-
-def thought_prose_lines(ch, width):
-    """Tail of the raw reasoning prose, headers stripped out. Shown only while
-    the request is in flight; the headers are what remain afterwards."""
-    text = _THOUGHT_HEADER_RE.sub(" ", ch.thought)
-    text = " ".join(text.split())
-    if not text:
-        return []
-    return textwrap.wrap(text, max(12, width - 1))[-THOUGHT_PROSE_LINES:]
-
-
 def render_live_block(ch, width):
-    block = [[(format_channel_status(ch) + THROBBER_FRAMES[throbber_frame],
-               STYLES['status_text'])]]
-    for line in thought_prose_lines(ch, width):
-        block.append([(line, STYLES['hint'])])
-    return block
+    """One line: the newest reasoning header where the status text goes, with
+    the dots still animating. Headers replace each other in place rather than
+    accumulating, and nothing survives the request."""
+    return [[(format_channel_status(ch) + THROBBER_FRAMES[throbber_frame],
+              STYLES['status_text'])]]
 
 
 def replace_live_block(ch, new_lines):
@@ -1282,7 +1271,7 @@ def tick_channels(width):
 
         if ch.status in ("done", "error") and not ch.busy:
             dirty = True
-            replace_live_block(ch, [[(h, STYLES['bold'])] for h in ch.thought_headers])
+            replace_live_block(ch, [])
             ch.status_index = None
             ch.live_len = 0
             ch.thread = None
