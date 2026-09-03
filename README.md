@@ -2213,3 +2213,28 @@ echo "America/Chicago" > /etc/timezone
   stdscr.timeout(50)
   ```
 - Timezone changes require process restart (`F6` twice or `./restart_ai.sh`).
+## 2026-04-30 - Camera Detection Fix (OV5647)
+
+### Context
+`rpicam-apps` was installed, but `rpicam-hello --list-cameras` reported "No cameras available" and `vcgencmd get_camera` reported `supported=0 detected=0`.
+
+### Investigation
+1. Checked `/boot/firmware/config.txt` for `camera_auto_detect=1` or incorrect overlays (like `imx708`).
+2. Found that NO camera overlay was present in `config.txt` (neither `camera_auto_detect` nor `dtoverlay=ov5647`).
+3. `gpu_mem_512=128` was already correctly set.
+
+### Changes Made
+- Appended `dtoverlay=ov5647` to `/boot/firmware/config.txt` to explicitly load the OV5647 driver, as `camera_auto_detect` can sometimes fail on certain kernels with this sensor.
+- Rebooted the system.
+
+### Verification
+- `vcgencmd get_camera` now reports `supported=1 detected=1`.
+- `rpicam-hello --list-cameras` lists the OV5647 sensor.
+- `rpicam-still -o /tmp/test.jpg -t 1000 -n --immediate` successfully captures a JPEG.
+
+## 2026-04-30 - Splash Screen and Capture Fixes
+
+### Changes Made
+- Rewrote `render_splash_line` in `casio_ai.py` to process inline color markers (`[[G]]...[[/G]]` and `[[R]]...[[/R]]`) in the rest-of-line portion regardless of whether the line begins with a recognized leading key token.
+- Replaced "Esc" reference in splash screen with "F3" to match the actual key handler for clearing the input buffer.
+- Swapped the capture upload logic in `processing_task` so that `Image.open(path)` is the primary path and `client.files.upload(file=path)` is the fallback, ensuring captured images are visible as inline base64 data in API logs.

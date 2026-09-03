@@ -7,6 +7,7 @@ runtime files into place.
 ## Important Files
 
 - `casio_ai.py` -> `/root/casio_ai.py`
+- `setup_calc.sh` -> `/root/setup_calc.sh`
 - `cyberdeck_boot.sh` -> `/root/cyberdeck_boot.sh`
 - `restart_ai.sh` -> `/root/restart_ai.sh`
 - `autostart_cyberdeck.sh` -> `/root/autostart_cyberdeck.sh`
@@ -22,6 +23,7 @@ Run these commands from the cloned repo on the Raspberry Pi:
 
 ```bash
 install -m 755 casio_ai.py /root/casio_ai.py
+install -m 755 setup_calc.sh /root/setup_calc.sh
 install -m 755 cyberdeck_boot.sh /root/cyberdeck_boot.sh
 install -m 755 restart_ai.sh /root/restart_ai.sh
 install -m 755 autostart_cyberdeck.sh /root/autostart_cyberdeck.sh
@@ -38,6 +40,23 @@ install -m 644 systemd/wifi-ensure.service /etc/systemd/system/wifi-ensure.servi
 systemctl daemon-reload
 systemctl enable cyberdeck.service wifi-ensure.service
 ```
+
+## API Key
+
+`casio_ai.py` in this repo has `API_KEY = "---"` as a placeholder. The real
+Gemini key is never committed. After copying the file into place, edit
+`/root/casio_ai.py` and set `API_KEY` to the live key.
+
+## Class Notes
+
+The class-context feature reads markdown files from `/root/notes`, which is a
+separate repo:
+
+```bash
+git clone https://github.com/evan-sie/casio-notes.git /root/notes
+```
+
+Without it the class selector has nothing to list.
 
 ## DietPi Settings To Reapply
 

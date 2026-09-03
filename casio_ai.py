@@ -13,6 +13,7 @@ import cv2
 # --- USER CONFIGURATION ---
 API_KEY = "---"
 MODEL_NAME = "gemini-3.1-pro-preview"
+NOTES_DIR = os.path.expanduser("~/notes")
 
 F1_PROMPT = """<system_instruction>
 <role_and_persona>
@@ -76,6 +77,17 @@ STOP. Do not attempt to solve the problem. Format your output exactly as follows
 * (Provide actionable instructions on what the user needs to do to get the required information to the AI. WARNING: NEVER SUGGEST USING A FLASH. Examples: "Move the cyberdeck camera 4 inches closer to the worksheet," "Adjust your body position to block the overhead glare," "Flatten the paper to remove the shadow," or "Move to a location with better ambient lighting.")
 =========================================
 </execution_logic>
+<session_context_reminder>
+RECALL YOUR CLASS CONTEXT: At the start of this session, you ingested course-specific
+methods, variable notation, and formulas. You MUST apply them now:
+- Every variable name in your solution must match the notation from that context exactly.
+  Do not substitute equivalent symbols from general convention.
+- The method and formula form you choose in [ANALYSIS] must be the one from that context,
+  not a textbook alternative unless absolutely necessary to solving the problem.
+- If a value's unit or symbol differs between the class context and general practice,
+  the class context wins.
+This is non-negotiable. Solving correctly but in the wrong notation is a wrong answer.
+</session_context_reminder>
 </system_instruction>"""
 
 # Scrolling: 4 lines at a time
@@ -169,10 +181,7 @@ KEY_MAP = {
 # ALPHA-mode-only overrides. In ABC mode these keys emit the mapped token
 # instead of gint's raw lowercase letter. Everything NOT in this dict falls
 # through to plain pass-through, preserving normal text entry.
-ALPHA_OVERRIDES = {
-    'K': 'x',   # , key  -> x  (common math variable)
-    'L': 'y',   # -> key -> y  (common math variable)
-}
+ALPHA_OVERRIDES = {}
 # --- END OF CONFIGURATION ---
 
 STYLES = {}
@@ -195,6 +204,9 @@ response_wait_start = 0.0
 force_redraw = False
 redraw_lock = threading.Lock()
 restart_confirm_active = False
+active_class_name = None
+context_confirm_active = False
+pending_class_md = None
 
 # Keyboard mode state
 input_mode = NUM
@@ -235,12 +247,12 @@ def initialize_theme(stdscr):
     # Base Attributes
     STYLES['bold'] = STYLES['normal'] | curses.A_BOLD
     STYLES['italic'] = STYLES['normal'] | curses.A_ITALIC
-    STYLES['user_input'] = STYLES['normal'] | curses.A_UNDERLINE
+    STYLES['user_input'] = STYLES['normal']
 
-    # Number Attributes (Dark Magenta + Italic)
-    STYLES['number'] = STYLES['number'] | curses.A_ITALIC
+    # Number Attributes (Dark Magenta)
+    STYLES['number'] = STYLES['number']
     STYLES['bold_number'] = STYLES['number'] | curses.A_BOLD
-    STYLES['italic_number'] = STYLES['number']
+    STYLES['italic_number'] = STYLES['number'] | curses.A_ITALIC
 
     # Diagnostics
     STYLES['diag_ok'] = STYLES['diag_ok'] | curses.A_BOLD
@@ -328,16 +340,7 @@ def get_diagnostics_styled():
 
 
 def parse_inner_text(text, base_style, is_bold=False):
-    segments = []
-    regex_italic = re.compile(r'(\*[^\*]+\*)')
-    parts_italic = [p for p in regex_italic.split(text) if p]
-    for p_ital in parts_italic:
-        if p_ital.startswith('*') and p_ital.endswith('*'):
-            content = p_ital[1:-1]
-            segments.extend(parse_inner_numbers(content, STYLES['italic'], is_bold))
-        else:
-            segments.extend(parse_inner_numbers(p_ital, base_style, is_bold))
-    return segments
+    return parse_inner_numbers(text, base_style, is_bold)
 
 
 def parse_inner_numbers(text, current_style, is_bold):
@@ -474,24 +477,27 @@ def render_splash_line(stdscr, y, block_x, w, line):
         stripped = line.lstrip()
         leading_ws = len(line) - len(stripped)
         gap = stripped.find("  ")
+        
+        cursor_x = block_x
+        
         if gap > 0 and (stripped[:gap].startswith('F') or
                         stripped[:gap] in ('Enter', 'Up/Down', 'Key', 'RSSI')):
             key_part = stripped[:gap]
             rest_part = stripped[gap:]
-            stdscr.addstr(y, block_x, " " * leading_ws, STYLES['normal'])
-            stdscr.addstr(y, block_x + leading_ws, key_part,
+            stdscr.addstr(y, cursor_x, " " * leading_ws, STYLES['normal'])
+            cursor_x += leading_ws
+            stdscr.addstr(y, cursor_x, key_part,
                           STYLES.get('splash_key', STYLES['normal']))
-            stdscr.addstr(y, block_x + leading_ws + len(key_part),
-                          rest_part[:max(0, w - block_x - leading_ws - len(key_part) - 1)],
-                          STYLES['normal'])
-            return
-
+            cursor_x += len(key_part)
+            line_to_process = rest_part
+        else:
+            line_to_process = line
+            
         # Inline-marker path: colors [[G]]...[[/G]], [[R]]...[[/R]] segments.
         marker_re = re.compile(r'\[\[(G|R)\]\](.*?)\[\[/\1\]\]')
-        cursor_x = block_x
         pos = 0
-        for m in marker_re.finditer(line):
-            before = line[pos:m.start()]
+        for m in marker_re.finditer(line_to_process):
+            before = line_to_process[pos:m.start()]
             if before:
                 stdscr.addstr(y, cursor_x, before[:max(0, w - cursor_x - 1)], STYLES['normal'])
                 cursor_x += len(before)
@@ -500,7 +506,7 @@ def render_splash_line(stdscr, y, block_x, w, line):
             stdscr.addstr(y, cursor_x, content[:max(0, w - cursor_x - 1)], style)
             cursor_x += len(content)
             pos = m.end()
-        tail = line[pos:]
+        tail = line_to_process[pos:]
         if tail:
             stdscr.addstr(y, cursor_x, tail[:max(0, w - cursor_x - 1)], STYLES['normal'])
     except curses.error:
@@ -584,7 +590,7 @@ def get_startup_splash_lines():
         "F6      Restart program  (press 2x)",
         "",
         "Enter   Send text message",
-        "Esc     Clear input buffer",
+        "F3      Clear input buffer",
         "Up/Down Scroll chat history",
         "",
         "RSSI    [[[G]]-30[[/G]], [[R]]-90[[/R]]] dBm",
@@ -612,6 +618,164 @@ def get_keyboard_splash_lines():
         for k, v in ALPHA_OVERRIDES.items():
             lines.append(f" {k:<3}   {v}")
     return lines
+
+
+def show_class_selector(stdscr):
+    if not os.path.exists(NOTES_DIR):
+        return None, None
+    md_files = [f for f in os.listdir(NOTES_DIR) if f.endswith('.md')]
+    if not md_files:
+        return None, None
+        
+    md_files.sort()
+    class_names = [f[:-3] for f in md_files]
+    
+    selected_idx = 0
+    stdscr.timeout(-1)
+    try:
+        while True:
+            stdscr.clear()
+            h, w = stdscr.getmaxyx()
+            
+            title_line = "=== SELECT CLASS CONTEXT ==="
+            footer_line = "[ Up/Down=navigate | Enter=select | F2=skip ]"
+            
+            total_rows = 1 + 1 + len(class_names) + 1 + 1
+            start_y = max(0, (h - total_rows) // 2)
+            
+            try:
+                x = max(0, (w - len(title_line)) // 2)
+                stdscr.addstr(start_y, x, title_line[:w - 1],
+                              STYLES.get('splash_title', STYLES['normal']))
+            except curses.error:
+                pass
+                
+            max_body_w = max((len(name) + 2 for name in class_names), default=0)
+            block_x = max(0, (w - max_body_w) // 2)
+            
+            for i, name in enumerate(class_names):
+                y = start_y + 2 + i
+                if y >= h - 2:
+                    break
+                try:
+                    if i == selected_idx:
+                        stdscr.addstr(y, block_x, f"> {name}"[:w - 1], STYLES['bold'])
+                    else:
+                        stdscr.addstr(y, block_x, f"  {name}"[:w - 1], STYLES['normal'])
+                except curses.error:
+                    pass
+                    
+            try:
+                y = min(h - 1, start_y + 2 + len(class_names) + 1)
+                x = max(0, (w - len(footer_line)) // 2)
+                stdscr.addstr(y, x, footer_line[:w - 1], STYLES['normal'] | curses.A_BOLD)
+            except curses.error:
+                pass
+                
+            stdscr.refresh()
+            
+            try:
+                k = stdscr.getch()
+            except curses.error:
+                continue
+                
+            if k == curses.KEY_UP:
+                selected_idx = max(0, selected_idx - 1)
+            elif k == curses.KEY_DOWN:
+                selected_idx = min(len(class_names) - 1, selected_idx + 1)
+            elif k == curses.KEY_ENTER or k == 10:
+                selected_class = class_names[selected_idx]
+                with open(os.path.join(NOTES_DIR, md_files[selected_idx]), 'r', encoding='utf-8') as f:
+                    md_content = f.read()
+                return selected_class, md_content
+            elif k == curses.KEY_F2:
+                return None, None
+    finally:
+        stdscr.timeout(50)
+
+def send_class_context(class_name, md_content, width):
+    global chat_session, processing_step, response_wait_start, response_holder
+    
+    chat_history.append([(f"[*] Loading {class_name} context...", STYLES['status_text'])])
+    
+    msg = f"""<class_context>
+You are being initialized for a {class_name} engineering problem-solving session.
+The following document contains the exact methods, variable notation, and formulas
+used in this course. Read it carefully and completely.
+
+---
+{md_content}
+---
+
+</class_context>
+
+<initialization_instruction>
+For this entire session you MUST:
+1. Use the variable names and notation defined in the document above.
+   If the course uses a specific symbol for a quantity, use that symbol — no substitutions.
+2. Apply the specific methods and formula forms shown above.
+3. When the class method and a general method differ, always prefer to use the class method.
+4. Treat this context as your ground truth for this subject.
+
+Respond with this confirmation line once you have understood and digested the context:
+"Context Loaded. Course: {class_name}"
+</initialization_instruction>"""
+
+    def _worker():
+        global chat_session, processing_step, response_wait_start, response_holder
+        try:
+            if chat_session is None:
+                chat_session = client.chats.create(model=MODEL_NAME)
+            response_wait_start = time.time()
+            processing_step = "WAITING"
+            response = chat_session.send_message(msg)
+            processing_step = "SENT"
+            time.sleep(0.5)
+            response_holder.append(response.text)
+        except Exception as e:
+            response_holder.append(f"Net Error: {e}")
+
+    response_holder.clear()
+    processing_step = "..."
+    response_wait_start = 0.0
+
+    worker = threading.Thread(target=_worker)
+    worker.start()
+
+    animation_frames = ['   ', '.  ', '.. ', '...']
+    tick_count = 0
+    frame_index = 0
+    
+    # We don't have stdscr here to redraw, so we wait for the thread 
+    # and let the main loop's diag_thread or the caller handle redraws if possible.
+    # Wait, the prompt says "animate a throbber in the status line while waiting".
+    # I will use sys._getframe(1).f_locals.get('stdscr') to get stdscr from main()
+    import sys
+    stdscr = sys._getframe(1).f_locals.get('stdscr')
+    
+    while worker.is_alive():
+        if tick_count % THROBBER_TICKS_PER_FRAME == 0:
+            frame_index = (frame_index + 1) % len(animation_frames)
+        status_text = format_status()
+        chat_history[-1] = [(status_text + animation_frames[frame_index], STYLES['status_text'])]
+        if stdscr:
+            draw_screen(stdscr, "")
+        time.sleep(THROBBER_TICK_SEC)
+        tick_count += 1
+
+    chat_history.pop()
+
+    if response_holder:
+        res = response_holder[0]
+        if res.startswith("Net Error"):
+            chat_history.append([(res, STYLES['diag_crit'])])
+        else:
+            chat_history.append([(res, STYLES['diag_ok'])])
+    else:
+        chat_history.append([("Error: No response from thread.", STYLES['diag_crit'])])
+        
+    if stdscr:
+        draw_screen(stdscr, "")
 
 
 # --- STATUS / UPLOAD STATE MACHINE --------------------------------------------
@@ -661,13 +825,13 @@ def processing_task(is_f1, current_input=None):
                 chat_session = client.chats.create(model=MODEL_NAME)
 
             # Upload separately from the message so state can transition cleanly
-            # between UPLOADING and WAITING. Falls back to inline PIL image if
-            # the Files API is unavailable for any reason.
+            # between UPLOADING and WAITING. Falls back to Files API if
+            # inline PIL image is unavailable for any reason.
             try:
-                uploaded_file = client.files.upload(file=path)
+                uploaded_file = Image.open(path)
                 message_parts = [F1_PROMPT, uploaded_file]
             except Exception:
-                uploaded_file = Image.open(path)
+                uploaded_file = client.files.upload(file=path)
                 message_parts = [F1_PROMPT, uploaded_file]
 
             processing_step = "UPLOADED"
@@ -786,6 +950,7 @@ def process_key_input(key_char):
 def main(stdscr):
     global scroll_offset, response_holder, force_redraw, chat_session, processing_step, restart_confirm_active
     global input_mode, sym_active, response_wait_start
+    global active_class_name, pending_class_md, context_confirm_active
 
     initialize_theme(stdscr)
     stdscr.keypad(True)
@@ -812,6 +977,18 @@ def main(stdscr):
 
     # Scrollable hint line printed into chat history after dismissing splash.
     add_splash_hint_line()
+
+    selected_class, class_md = show_class_selector(stdscr)
+    if selected_class:
+        active_class_name = selected_class
+        pending_class_md = class_md
+        context_confirm_active = True
+        chat_history.append([(f"Class: {active_class_name}", STYLES['mode_alpha'] | curses.A_BOLD)])
+        chat_history.append([(f"[?] Press Enter to load {active_class_name} context, or F2 to skip", STYLES['diag_ok'])])
+        chat_area_height = height - len(header_lines) - 1
+        scroll_offset = max(0, len(chat_history) - chat_area_height)
+    else:
+        chat_history.append([("Class: None", STYLES['normal'])])
 
     diag_thread = threading.Thread(target=update_diagnostics_periodically, daemon=True)
     diag_thread.start()
@@ -840,13 +1017,32 @@ def main(stdscr):
             chat_history.pop()
             needs_redraw = True
 
+        if context_confirm_active:
+            if key == curses.KEY_ENTER or key == 10:
+                context_confirm_active = False
+                send_class_context(active_class_name, pending_class_md, width)
+                pending_class_md = None
+                needs_redraw = True
+                continue
+            elif key == curses.KEY_F2:  # F2 to skip
+                context_confirm_active = False
+                pending_class_md = None
+                active_class_name = None
+                chat_history.append([("Context skipped. Running in general mode.", STYLES['normal'])])
+                chat_area_height = height - len(header_lines) - 1
+                scroll_offset = max(0, len(chat_history) - chat_area_height)
+                needs_redraw = True
+                continue
+            else:
+                continue
+
         if key == curses.KEY_UP:
             scroll_offset -= SCROLL_JUMP
         elif key == curses.KEY_DOWN:
             scroll_offset += SCROLL_JUMP
         elif key == curses.KEY_BACKSPACE or key == 127:
             current_input = current_input[:-1]
-        elif key == 27:  # Esc (kept for SSH convenience; calculator has no Esc)
+        elif key == 27 or key == curses.KEY_F3:  # Esc (kept for SSH convenience; calculator has no Esc)
             current_input = ""
             sym_active = False
 
