@@ -55,6 +55,11 @@ OPENAI_REASONING_EFFORT = "max"
 # One silent retry before the deck asks what to do about a failing model.
 AUTO_RETRY_LIMIT = 1
 
+# Relative gap between the two final numbers before DIFF lights up. Tight
+# tolerances flag sig-fig noise ("2.02 s" vs "2.0 s") and the marker stops
+# meaning anything, so this is deliberately loose.
+DIFF_TOLERANCE = 0.01
+
 # Viewfinder (SYM+F1). Capture stops it -- the camera is exclusive.
 VF_WIDTH, VF_HEIGHT, VF_FPS = 320, 180, 15
 VF_GEOMETRY = "396x224+0+0"
@@ -241,7 +246,8 @@ def new_gemini_chat():
         model=MODEL_NAME,
         config=genai_types.GenerateContentConfig(
             thinking_config=genai_types.ThinkingConfig(
-                thinking_level=GEMINI_THINKING_LEVEL)))
+                thinking_level=GEMINI_THINKING_LEVEL,
+                include_thoughts=True)))
 
 
 # Each Channel owns its own session; there is deliberately no module-level
@@ -284,6 +290,8 @@ class Channel:
         self.status_index = None
         self.last_answer = None   # extracted final number, for the DIFF marker
         self.last_usage = None    # token usage of the last call, if reported
+        self.thought = ""         # streamed reasoning summary
+        self.thought_label = ""   # newest **header** from it, for the status line
         self.enabled = True
 
     @property
@@ -291,7 +299,7 @@ class Channel:
         return self.thread is not None and self.thread.is_alive()
 
 
-channels = {GEMINI: Channel(GEMINI, "GEMINI"), OPENAI_CH: Channel(OPENAI_CH, "OPENAI")}
+channels = {GEMINI: Channel(GEMINI, "GEMINI"), OPENAI_CH: Channel(OPENAI_CH, "GPT")}
 active_channel = GEMINI
 
 # chat_history aliases the active channel's list, so every existing helper that
@@ -399,7 +407,7 @@ def get_diagnostics_styled():
             temp_c = int(f.read()) / 1000.0
         temp_text = f"{temp_c:.0f}C"
         temp_style = ok if temp_c < 50 else (warn if temp_c < 70 else crit)
-        segments.extend([("CPU: ", normal), (temp_text, temp_style)])
+        segments.append((temp_text, temp_style))
 
         # RAM
         with open('/proc/meminfo', 'r') as f:
@@ -408,9 +416,9 @@ def get_diagnostics_styled():
         mem_used_mb = (mem_total_kb - mem_avail_kb) / 1024
         mem_total_mb = mem_total_kb / 1024
         usage_percent = (mem_used_mb / mem_total_mb) * 100
-        ram_text = f"{int(mem_used_mb)}/{int(mem_total_mb)}M"
+        ram_text = f"{int(mem_used_mb)}/{int(mem_total_mb)}"
         ram_style = ok if usage_percent < 50 else (warn if usage_percent < 75 else crit)
-        segments.extend([(" | RAM: ", normal), (ram_text, ram_style)])
+        segments.extend([(" ", normal), (ram_text, ram_style)])
 
         # WiFi signal bar + dBm (unchanged behavior from before)
         try:
@@ -419,20 +427,29 @@ def get_diagnostics_styled():
             match = re.search(r"signal: (-?\d+)", link)
             if ssid and match:
                 signal_dbm = int(match.group(1))
-                if signal_dbm >= -55:
-                    bar_str, bar_style = "[####]", ok
-                elif signal_dbm >= -65:
-                    bar_str, bar_style = "[### ]", ok
+                # Colour the dBm rather than spending columns on a bar.
+                if signal_dbm >= -65:
+                    dbm_style = ok
                 elif signal_dbm >= -75:
-                    bar_str, bar_style = "[##  ]", warn
+                    dbm_style = warn
                 else:
-                    bar_str, bar_style = "[#   ]", crit
-                segments.extend([(" | WiFi: ", normal), (bar_str, bar_style), (f" ({signal_dbm})", normal)])
+                    dbm_style = crit
+                segments.extend([(f" {ssid} ", normal), (str(signal_dbm), dbm_style)])
         except (subprocess.CalledProcessError, FileNotFoundError):
-            segments.extend([(" | WiFi: ", normal), ("OFF", crit)])
+            segments.extend([(" ", normal), ("NOWIFI", crit)])
 
-        # RTC in military time (HH:MM local) -- replaces token counter.
-        segments.extend([(" | ", normal), (time.strftime("%H:%M"), normal | curses.A_BOLD)])
+        # Active model, coloured by its health: green ok, red failed or off,
+        # amber while a request is in flight.
+        ch = channels[active_channel]
+        if not ch.enabled or ch.awaiting_choice or ch.status == "error":
+            model_style = crit
+        elif ch.status == "working":
+            model_style = warn
+        else:
+            model_style = ok
+        segments.extend([(" ", normal), (ch.label, model_style | curses.A_BOLD)])
+        if answers_disagree():
+            segments.append((" DIFF", crit | curses.A_BOLD))
 
         return segments
     except Exception:
@@ -582,7 +599,7 @@ def render_splash_line(stdscr, y, block_x, w, line):
         
         if gap > 0 and (stripped[:gap].startswith('F') or
                         stripped[:gap].startswith('SYM+') or
-                        stripped[:gap] in ('Enter', 'Up/Down', 'Key', 'RSSI')):
+                        stripped[:gap] in ('Enter', 'Up/Down', 'Key', 'RSSI', 'IP')):
             key_part = stripped[:gap]
             rest_part = stripped[gap:]
             stdscr.addstr(y, cursor_x, " " * leading_ws, STYLES['normal'])
@@ -682,6 +699,18 @@ def show_splash_system(stdscr):
         current = 'KBMAP' if current == 'FKEYS' else 'FKEYS'
 
 
+def get_wlan_ip():
+    """Current wlan0 address. The deck moves between networks, so the splash
+    has to report the live one rather than anything baked in."""
+    try:
+        out = subprocess.run(["ip", "-4", "addr", "show", "wlan0"],
+                             capture_output=True, text=True, timeout=2).stdout
+        match = re.search(r"inet (\d+\.\d+\.\d+\.\d+)", out)
+        return match.group(1) if match else "no address"
+    except (OSError, subprocess.SubprocessError):
+        return "unknown"
+
+
 def get_startup_splash_lines():
     return [
         "F1      Capture & analyze image",
@@ -699,6 +728,7 @@ def get_startup_splash_lines():
         "Up/Down Scroll chat history",
         "",
         "RSSI    [[[G]]-30[[/G]], [[R]]-90[[/R]]] dBm",
+        f"IP      {get_wlan_ip()}",
     ]
 
 
@@ -975,10 +1005,14 @@ def format_channel_status(ch):
     if step == "WAITING":
         elapsed = max(0.0, time.time() - ch.wait_start)
         if elapsed < 60.0:
-            return f"[*] {ch.label} thinking ({elapsed:.1f})"
-        mins = int(elapsed // 60)
-        secs = elapsed - (mins * 60)
-        return f"[*] {ch.label} thinking ({mins}min{secs:.1f})"
+            clock = f"{elapsed:.1f}"
+        else:
+            mins = int(elapsed // 60)
+            clock = f"{mins}min{elapsed - (mins * 60):.1f}"
+        # Say what the model is actually doing once it starts reporting.
+        if ch.thought_label:
+            return f"[*] {ch.thought_label} ({clock})"
+        return f"[*] {ch.label} thinking ({clock})"
     return "[*] ..."
 
 
@@ -1007,11 +1041,33 @@ def answers_disagree():
     b = channels[OPENAI_CH].last_answer
     if a is None or b is None:
         return False
-    scale = max(abs(a), abs(b), 1.0)
-    return abs(a - b) > 1e-6 * scale
+    scale = max(abs(a), abs(b))
+    if scale == 0:
+        return False
+    return abs(a - b) / scale > DIFF_TOLERANCE
 
 
 # --- PER-MODEL REQUESTS -----------------------------------------------------
+
+_THOUGHT_HEADER_RE = re.compile(r"\*\*(.+?)\*\*")
+
+
+def note_thought(ch, text):
+    """Fold a streamed reasoning fragment into the channel.
+
+    Both models head each step with a bold title (`**Calculating fall time**`),
+    which is a far better fit for a 40-column screen than raw summary prose.
+    Falls back to the tail of the text when there is no header yet."""
+    if not text:
+        return
+    ch.thought += text
+    headers = _THOUGHT_HEADER_RE.findall(ch.thought)
+    if headers:
+        label = headers[-1]
+    else:
+        label = " ".join(ch.thought.split())[-32:]
+    ch.thought_label = " ".join(label.split())[:32]
+
 
 def _gemini_request(ch, is_f1, path, text):
     if client is None:
@@ -1032,7 +1088,19 @@ def _gemini_request(ch, is_f1, path, text):
 
     ch.wait_start = time.time()
     ch.step = "WAITING"
-    return ch.session.send_message(parts).text
+
+    answer = []
+    for chunk in ch.session.send_message_stream(parts):
+        for cand in (chunk.candidates or []):
+            content = getattr(cand, "content", None)
+            for part in (getattr(content, "parts", None) or []):
+                if not getattr(part, "text", None):
+                    continue
+                if getattr(part, "thought", False):
+                    note_thought(ch, part.text)
+                else:
+                    answer.append(part.text)
+    return "".join(answer)
 
 
 def _openai_request(ch, is_f1, path, text):
@@ -1060,16 +1128,27 @@ def _openai_request(ch, is_f1, path, text):
     ch.step = "WAITING"
     kwargs = {
         "model": OPENAI_MODEL_NAME,
-        "reasoning": {"effort": OPENAI_REASONING_EFFORT},
+        "reasoning": {"effort": OPENAI_REASONING_EFFORT, "summary": "auto"},
         "input": [{"role": "user", "content": content}],
+        "stream": True,
     }
     # Chain turns server-side so the photo is not re-uploaded every message.
     if ch.prev_response_id:
         kwargs["previous_response_id"] = ch.prev_response_id
-    response = ch.session.responses.create(**kwargs)
-    ch.prev_response_id = response.id
-    ch.last_usage = getattr(response, "usage", None)
-    return response.output_text
+
+    answer = []
+    for event in ch.session.responses.create(**kwargs):
+        etype = getattr(event, "type", "") or ""
+        if etype.endswith("reasoning_summary_text.delta"):
+            note_thought(ch, getattr(event, "delta", "") or "")
+        elif etype.endswith("output_text.delta"):
+            answer.append(getattr(event, "delta", "") or "")
+        elif etype.endswith("response.completed"):
+            final = getattr(event, "response", None)
+            if final is not None:
+                ch.prev_response_id = getattr(final, "id", None)
+                ch.last_usage = getattr(final, "usage", None)
+    return "".join(answer)
 
 
 REQUEST_FNS = {GEMINI: _gemini_request, OPENAI_CH: _openai_request}
@@ -1104,6 +1183,8 @@ def launch_channel(ch, width):
     ch.step = "UPLOADING" if ch.pending[0] else "WAITING"
     ch.answer = None
     ch.error = None
+    ch.thought = ""
+    ch.thought_label = ""
     ch.awaiting_choice = False
     ch.status_index = len(ch.history)
     add_to_channel(ch, "[*] ...", width)
@@ -1199,36 +1280,12 @@ def _handle_channel_error(ch, width):
                    force_style=STYLES['diag_crit'])
 
 
-def get_model_header_segments():
-    """Second header row: which model you are looking at, and how the other
-    one is doing, so a failure is visible without switching."""
-    normal = STYLES['normal']
-    segs = []
-    for i, key in enumerate((GEMINI, OPENAI_CH)):
-        ch = channels[key]
-        if i:
-            segs.append(("  ", normal))
-        is_active = (key == active_channel)
-        segs.append((f"[{ch.label}] " if is_active else f" {ch.label}  ",
-                     (STYLES.get('mode_num', normal) | curses.A_BOLD) if is_active
-                     else STYLES.get('hint', normal)))
-        if not ch.enabled:
-            segs.append(("off", STYLES.get('hint', normal)))
-        elif ch.status == "working":
-            segs.append(("...", STYLES['diag_warn']))
-        elif ch.awaiting_choice or ch.status == "error":
-            segs.append(("ERR", STYLES['diag_crit']))
-        else:
-            segs.append(("ok", STYLES['diag_ok']))
-    if answers_disagree():
-        segs.append(("  DIFF", STYLES['diag_crit'] | curses.A_BOLD))
-    return segs
-
-
 def refresh_model_header():
+    """The active model lives in the single toolbar row, so a change of model
+    or status is just a toolbar rebuild."""
     with redraw_lock:
-        if len(header_lines) > 1:
-            header_lines[1] = get_model_header_segments()
+        if header_lines:
+            header_lines[0] = get_diagnostics_styled()
 
 
 def compare_answers(width):
@@ -1358,7 +1415,6 @@ def main(stdscr):
     needs_redraw = True
 
     header_lines.append(get_diagnostics_styled())
-    header_lines.append(get_model_header_segments())
 
     # Scrollable hint line printed into chat history after dismissing splash.
     add_splash_hint_line()

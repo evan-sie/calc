@@ -2462,3 +2462,67 @@ VX, gravity is 9.79"), then asked a follow-up in a separate turn:
 
 Tested with a small stand-in document rather than the real course notes, to
 keep the token spend down.
+
+## 2026-09-03 - Compact Toolbar, Live Thoughts, IP on Splash
+
+### Toolbar
+The model status had spilled onto a second header row, costing a line of chat
+on a 224px screen. It is now one row:
+
+```
+[123] 39C 181/354 Rawon -68 GEMINI
+```
+
+Keyboard mode, CPU temp, RAM, SSID, dBm, active model. The `CPU:`/`RAM:`/
+`WiFi:` labels and the `[####]` signal bar were dropped -- the numbers carry
+their own meaning and the colour carries the rest. Colour coding:
+
+- **Temp / RAM:** green, amber, red on the existing thresholds.
+- **dBm:** green at -65 or better, amber to -75, red below.
+- **Model:** shows the *active* model (`GEMINI` or `GPT`), green when healthy,
+  red when failed or switched off, amber while a request is in flight.
+- `DIFF` appends when the two final answers disagree.
+
+The other model's health is not on the bar; a failure still announces itself in
+the chat of whichever view you are in.
+
+### Live Thoughts
+Both models now stream, and the status line reports what the model is actually
+doing instead of a generic "thinking":
+
+```
+[*] Calculating the Impact (1.6)
+```
+
+Both providers head each reasoning step with a bold title, so `note_thought()`
+keeps the newest `**header**` and shows that, falling back to the tail of the
+summary text when no header has arrived. Longest observed status line is 33
+characters, inside the ~40 the screen allows.
+
+- **Gemini:** `include_thoughts=True` plus `send_message_stream()`; thought
+  parts are separated from answer parts by `part.thought`.
+- **OpenAI:** `summary: "auto"` with `stream=True`, reading
+  `reasoning_summary_text.delta` for thoughts and `output_text.delta` for the
+  answer. `response.completed` still carries the id and usage, so
+  `previous_response_id` chaining and cost tracking survive the switch.
+
+First thought appears at ~1.9s on Gemini and ~8s on OpenAI at effort max.
+
+### DIFF Tolerance
+The first end-to-end run had Gemini answer `2.02 seconds` and GPT `2.0
+seconds` -- the same answer to different significant figures. Against the
+original 1e-6 tolerance that would have raised DIFF on essentially every
+question. `DIFF_TOLERANCE` is now a relative 1%, which ignores sig-fig noise
+and `9.81` vs `9.79` while still catching genuinely different results.
+
+### Splash
+The F2 splashscreen now shows the deck's live `wlan0` address, read at
+render time via `get_wlan_ip()`, so the address for SSH is always the current
+one rather than whatever it was last time.
+
+### Verification
+- Toolbar rendered headless in all three model states plus the DIFF case.
+- Streaming run: Gemini answered `Approximately 2.02 seconds`, GPT `About 2.0
+  seconds`, both with live thought labels (8 and 12 distinct labels).
+- OpenAI chaining id and usage still captured through the streaming path.
+- Splash reports `IP      192.168.50.125`.
