@@ -2614,3 +2614,85 @@ Both checks run offline against stubbed styles, no API calls:
 - Thinking line: three successive headers each replaced the previous on a
   single line with the throbber advancing; after completion the channel held
   exactly one line, the answer.
+
+## 2026-09-17 - Stability Pass: Error Spam, Frozen UI, Invisible Viewfinder
+
+Reported as: keyboard input sometimes dead, F1 crashing the program, the
+viewfinder eating RAM with nothing on screen, and the deck falling apart when
+the WiFi drops mid-request. Four causes, three of them software.
+
+### 1. The Error Reap Loop (the big one)
+`_handle_channel_error()` leaves `ch.status == "error"` when it hands the
+retry/stop choice to the user, but `tick_channels()` reaped on
+`ch.status in ("done", "error") and not ch.busy`. After the first reap the
+thread is gone, so `busy` is False and the status is still `"error"` --
+**the same failed request was reaped again on every tick**, re-appending the
+error block at 20Hz. Measured: 3 lines per tick, 60 lines/second, forever.
+
+That one bug produced most of the reported symptoms:
+- the repeated "unavailable" messages when the hotspot dropped,
+- RAM climbing without bound as the history list grew,
+- and the unresponsive keyboard, because every tick set `dirty` and forced a
+  full clear-and-redraw over an ever-growing history.
+
+Reaping is now gated on `ch.thread is not None`, which the reap itself clears,
+so it fires exactly once per request.
+
+### 2. Capture Froze the Whole UI
+`rpicam-still` ran via `subprocess.run()` **on the main loop with no timeout**.
+A healthy camera returns in ~4s; a wedged OV5647 does not return at all. The
+main loop is what reads the keyboard and animates the throbber, so a stalled
+camera froze the entire program -- indistinguishable from a crash.
+
+The capture now runs on a worker (`start_capture` / `_run_capture` /
+`tick_capture`) with a hard `CAPTURE_TIMEOUT_SEC` of 30s, after which the
+attempt is abandoned and reported as `Cam Fail: camera timeout`. Measured on
+the current flaky camera: a 25.8s capture during which the UI ticked 512 times
+instead of 0.
+
+One frame still feeds both models -- `tick_capture` hands the finished photo to
+each enabled channel, so the cross-check is still on identical input.
+
+### 3. Invisible Viewfinder
+`rpicam-vid` starts, the camera never delivers a frame, mpv sits waiting for
+data and never creates a Wayland surface. Processes run, RAM climbs, nothing
+appears, and nothing reports an error. `check_viewfinder_alive()` now looks for
+the mpv surface in the sway tree after `VF_WATCHDOG_SEC` (12s; a healthy start
+takes 3-8s), and if it is missing tears the pipeline down and says
+`[!] Viewfinder: no frames (camera)`.
+
+The tree is parsed as JSON rather than grepped -- swaymsg's whitespace is not a
+contract.
+
+### 4. Request Timeouts and Upload Size
+Both SDKs default to minutes before giving up, so a half-open socket on a
+dropped hotspot looked like a hang. Both clients now use
+`REQUEST_TIMEOUT_SEC` (120s), and the OpenAI client is built with
+`max_retries=0` because the deck runs its own retry and reports it.
+
+Uploads are downscaled by `prepare_upload()` before they go over the air.
+2048px on the longest edge at quality 88 keeps roughly 240 px/inch on a letter
+page, so 12pt text lands near 40px tall and subscripts near 20px -- well inside
+what OCR reads. Resolution matters far more than JPEG quality for small glyphs,
+so the dimension is deliberately generous. Measured 76% smaller on a real
+capture. If the frame does not actually shrink, the original is sent.
+
+### 5. Crashes Now Leave Evidence
+`foot` exits with the process and takes the traceback with it. `__main__` now
+appends tracebacks to `/tmp/casio_ai_crash.log` before re-raising.
+
+### The Hardware Half
+The camera itself is failing, and no software change fixes it:
+
+```
+Dequeue timer of 1000000.00us has expired!
+Camera frontend has timed out!
+Please check that your camera sensor connector is attached securely.
+Alternatively, try another cable and/or sensor.
+```
+
+libcamera still enumerates the OV5647 and all its modes, so the sensor is
+detected -- it just stops delivering frames and has to reset itself, which is
+what makes captures take 10-26s instead of ~4s. That pattern points at the CSI
+ribbon rather than the sensor. Reseat both ends of the cable; try another
+cable before suspecting the module.

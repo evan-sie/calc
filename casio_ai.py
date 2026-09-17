@@ -6,6 +6,7 @@ import time
 import threading
 import signal
 import base64
+import json
 from google import genai
 from google.genai import types as genai_types
 from PIL import Image
@@ -55,6 +56,23 @@ OPENAI_REASONING_EFFORT = "max"
 # One silent retry before the deck asks what to do about a failing model.
 AUTO_RETRY_LIMIT = 1
 
+# The OV5647 can wedge and take ~10s to reset itself, so the capture runs off
+# the main loop and is abandoned outright past this.
+CAPTURE_TIMEOUT_SEC = 30
+
+# Stop waiting on an API call rather than hanging on a half-open socket when
+# the hotspot drops. The SDKs default to minutes.
+REQUEST_TIMEOUT_SEC = 120
+
+# Longest edge for the uploaded photo. The full 2592x1944 frame is ~950KB,
+# which is painful on a flaky 2.4GHz link. 2048 keeps roughly 240 px/inch on a
+# letter page -- 12pt text lands around 40px tall and subscripts around 20px,
+# which OCR reads comfortably. Resolution matters far more than JPEG quality
+# for small glyphs, so the dimension is deliberately generous and the quality
+# only moderately reduced. Lower these only against a real worksheet.
+UPLOAD_MAX_DIM = 2048
+UPLOAD_QUALITY = 88
+
 # Relative gap between the two final numbers before DIFF lights up. Tight
 # tolerances flag sig-fig noise ("2.02 s" vs "2.0 s") and the marker stops
 # meaning anything, so this is deliberately loose.
@@ -64,6 +82,8 @@ DIFF_TOLERANCE = 0.01
 VF_WIDTH, VF_HEIGHT, VF_FPS = 320, 180, 15
 VF_GEOMETRY = "396x224+0+0"
 VF_CAMERA_RELEASE_SEC = 0.3
+# If no mpv surface exists by now the camera never delivered a frame.
+VF_WATCHDOG_SEC = 12
 NOTES_DIR = os.path.expanduser("~/notes")
 
 F1_PROMPT = """<system_instruction>
@@ -254,7 +274,10 @@ def new_gemini_chat():
 # one, so context can never be loaded into a session that nothing answers from.
 client = None
 try:
-    client = genai.Client(api_key=API_KEY)
+    client = genai.Client(
+        api_key=API_KEY,
+        http_options=genai_types.HttpOptions(
+            timeout=REQUEST_TIMEOUT_SEC * 1000))
 except Exception:
     client = None
 
@@ -321,6 +344,8 @@ sym_active = False
 
 # Viewfinder overlay state
 viewfinder_process = None
+viewfinder_started = 0.0
+viewfinder_checked = False
 
 # Stats State
 last_net_stats = {'time': 0, 'rx': 0, 'tx': 0}
@@ -936,7 +961,7 @@ def start_viewfinder():
 
     OV5647 is fixed-focus at 7in with no AF motor, so there is no autofocus
     or lens-position handling here."""
-    global viewfinder_process
+    global viewfinder_process, viewfinder_started, viewfinder_checked
 
     if viewfinder_process is not None:
         return False
@@ -956,6 +981,8 @@ def start_viewfinder():
         viewfinder_process = subprocess.Popen(
             cmd, shell=True, stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL, preexec_fn=os.setsid)
+        viewfinder_started = time.time()
+        viewfinder_checked = False
     except (OSError, subprocess.SubprocessError):
         viewfinder_process = None
         _swaymsg('[app_id="foot"]', "fullscreen", "enable")
@@ -964,8 +991,52 @@ def start_viewfinder():
     return True
 
 
+def check_viewfinder_alive(width):
+    """A camera that never delivers a frame leaves mpv running with no surface:
+    RAM climbing, nothing on screen, no error anywhere. Catch that and say so."""
+    global viewfinder_checked
+
+    if viewfinder_process is None or viewfinder_checked:
+        return False
+    if time.time() - viewfinder_started < VF_WATCHDOG_SEC:
+        return False
+
+    viewfinder_checked = True
+    try:
+        out = subprocess.run(["swaymsg", "-t", "get_tree"],
+                             capture_output=True, text=True, timeout=3)
+        if out.returncode != 0:
+            return False
+        # Parse rather than grep: swaymsg's whitespace is not a contract.
+        found = []
+
+        def walk(node):
+            if node.get("app_id") == "mpv":
+                found.append(node)
+            for child in node.get("nodes", []) + node.get("floating_nodes", []):
+                walk(child)
+
+        walk(json.loads(out.stdout))
+        visible = bool(found)
+    except (OSError, subprocess.SubprocessError, ValueError):
+        return False
+
+    if visible:
+        return False
+
+    stop_viewfinder()
+    add_to_channel(channels[active_channel],
+                   "[!] Viewfinder: no frames (camera)", width,
+                   force_style=STYLES['diag_crit'])
+    return True
+
+
 def toggle_viewfinder(width):
     """SYM+F1 handler. The same key closes it; so does an F1 capture."""
+    if viewfinder_process is None and pending_capture.thread is not None:
+        parse_and_add_history("[!] Busy capturing", width,
+                              force_style=STYLES['diag_warn'])
+        return
     if viewfinder_process is None:
         if start_viewfinder():
             parse_and_add_history("[*] Viewfinder ON  (SYM+F1 to close)", width)
@@ -1123,7 +1194,9 @@ def _openai_request(ch, is_f1, path, text):
     if not OPENAI_API_KEY:
         raise RuntimeError("No OpenAI key. Set OPENAI_API_KEY in %s" % ENV_FILE)
     if ch.session is None:
-        ch.session = OpenAI(api_key=OPENAI_API_KEY)
+        # max_retries=0: the deck does its own retry and tells you about it.
+        ch.session = OpenAI(api_key=OPENAI_API_KEY,
+                            timeout=REQUEST_TIMEOUT_SEC, max_retries=0)
 
     if is_f1:
         ch.step = "UPLOADING"
@@ -1229,6 +1302,120 @@ def launch_channel(ch, width):
     ch.thread.start()
 
 
+class PendingCapture:
+    """A photo being taken. Separate from the Channels because one frame feeds
+    both models."""
+
+    def __init__(self):
+        self.thread = None
+        self.path = None
+        self.error = None
+
+
+pending_capture = PendingCapture()
+
+
+def prepare_upload(path):
+    """Shrink the frame before it goes over the air.
+
+    The full 2592x1944 capture is ~950KB, which on a weak hotspot is the
+    difference between a request that completes and one that stalls. Falls back
+    to the original if PIL cannot do it."""
+    try:
+        out = "/tmp/capture_upload.jpg"
+        with Image.open(path) as im:
+            im = im.convert("RGB")
+            # thumbnail() only ever shrinks, so a small frame is left alone.
+            im.thumbnail((UPLOAD_MAX_DIM, UPLOAD_MAX_DIM), Image.LANCZOS)
+            im.save(out, "JPEG", quality=UPLOAD_QUALITY, optimize=True)
+        # If it did not actually get smaller, send the original untouched.
+        if os.path.getsize(out) >= os.path.getsize(path):
+            return path
+        return out
+    except Exception:
+        return path
+
+
+def _run_capture(cap):
+    """Worker body: release the camera, shoot, shrink. Never touches curses."""
+    global force_redraw
+
+    if stop_viewfinder():
+        force_redraw = True
+
+    path = "/tmp/capture.jpg"
+    cmd = ["rpicam-still", "-o", path, "-t", "100",
+           "--width", "2592", "--height", "1944",
+           "--exposure", "sport", "-q", "95", "-n", "--immediate"]
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True,
+                                timeout=CAPTURE_TIMEOUT_SEC)
+    except subprocess.TimeoutExpired:
+        # A wedged OV5647 never returns; abandoning it keeps the deck usable.
+        subprocess.run(["pkill", "-x", "rpicam-still"], capture_output=True)
+        cap.error = "camera timeout (%ds)" % CAPTURE_TIMEOUT_SEC
+        return
+    except OSError as e:
+        cap.error = str(e)[:40]
+        return
+
+    if result.returncode != 0 or not os.path.exists(path):
+        tail = (result.stderr or "").strip().split("\n")[-1][:40]
+        cap.error = tail or "unknown"
+        return
+
+    cap.path = prepare_upload(path)
+
+
+def start_capture(width):
+    """Take the photo off the main loop so a stalled camera cannot freeze the
+    UI, which is exactly what an F1 press used to do."""
+    cap = pending_capture
+    cap.error = None
+    cap.path = None
+
+    for key in (GEMINI, OPENAI_CH):
+        ch = channels[key]
+        if not ch.enabled:
+            continue
+        if ch.history:
+            add_to_channel(ch, " ", width)
+        ch.status = "working"
+        ch.step = "CAPTURING"
+        ch.thread = None          # no API worker yet, so the reaper skips it
+        ch.status_index = len(ch.history)
+        ch.live_len = 0
+        replace_live_block(ch, [[("[*] ...", STYLES['status_text'])]])
+
+    cap.thread = threading.Thread(target=_run_capture, args=(cap,), daemon=True)
+    cap.thread.start()
+
+
+def tick_capture(width):
+    """Hand the finished photo to both models, or report why there isn't one."""
+    cap = pending_capture
+    if cap.thread is None or cap.thread.is_alive():
+        return False
+    cap.thread = None
+
+    waiting = [channels[k] for k in (GEMINI, OPENAI_CH)
+               if channels[k].status == "working" and channels[k].thread is None]
+    for ch in waiting:
+        replace_live_block(ch, [])
+        ch.status_index = None
+        ch.live_len = 0
+        ch.status = "idle"
+        if cap.error:
+            add_to_channel(ch, f"Cam Fail: {cap.error}", width,
+                           force_style=STYLES['diag_crit'])
+        else:
+            ch.pending = (True, cap.path, "")
+            ch.retries = 0
+            ch.last_answer = None
+            launch_channel(ch, width)
+    return True
+
+
 def dispatch_capture(is_f1, path, text, width):
     """Fire every enabled channel in parallel. Each gets its own turn."""
     started = []
@@ -1255,6 +1442,11 @@ def tick_channels(width):
     global throbber_frame, throbber_tick
     dirty = False
 
+    if tick_capture(width):
+        dirty = True
+    if check_viewfinder_alive(width):
+        dirty = True
+
     throbber_tick += 1
     if throbber_tick % THROBBER_TICKS_PER_FRAME == 0:
         throbber_frame = (throbber_frame + 1) % len(THROBBER_FRAMES)
@@ -1269,7 +1461,8 @@ def tick_channels(width):
             if throbber_tick % THROBBER_TICKS_PER_FRAME == 0:
                 dirty = True
 
-        if ch.status in ("done", "error") and not ch.busy:
+        # ch.thread is cleared below, so this fires once per request.
+        if ch.thread is not None and not ch.busy and ch.status in ("done", "error"):
             dirty = True
             replace_live_block(ch, [])
             ch.status_index = None
@@ -1625,28 +1818,13 @@ def main(stdscr):
                 current_input = ""
                 continue
 
-            path = "/tmp/capture.jpg"
-            if is_f1_press:
-                # The camera is exclusive: the viewfinder must let go first.
-                if stop_viewfinder():
-                    force_redraw = True
-                for k in (GEMINI, OPENAI_CH):
-                    channels[k].step = "CAPTURING"
-                refresh_model_header()
-                draw_screen(stdscr, current_input)
-                cmd = ["rpicam-still", "-o", path, "-t", "100",
-                       "--width", "2592", "--height", "1944",
-                       "--exposure", "sport", "-q", "95", "-n", "--immediate"]
-                result = subprocess.run(cmd, capture_output=True, text=True)
-                if result.returncode != 0 or not os.path.exists(path):
-                    tail = result.stderr.strip().split("\n")[-1][:30] if result.stderr else "unknown"
-                    parse_and_add_history(f"Cam Fail: {tail}...", width,
-                                          force_style=STYLES['diag_crit'])
-                    scroll_offset = max(0, len(chat_history) - chat_area_height)
-                    continue
-
             # One photo, one turn appended to each model's own conversation.
-            dispatch_capture(is_f1_press, path, current_input, width)
+            # The capture itself runs on a worker; tick_capture hands the frame
+            # to both models when it lands.
+            if is_f1_press:
+                start_capture(width)
+            else:
+                dispatch_capture(False, None, current_input, width)
             refresh_model_header()
             current_input = ""
             chat_area_height = height - len(header_lines) - 1
@@ -1663,5 +1841,19 @@ def main(stdscr):
                 pass
 
 
+CRASH_LOG = "/tmp/casio_ai_crash.log"
+
 if __name__ == "__main__":
-    curses.wrapper(main)
+    try:
+        curses.wrapper(main)
+    except KeyboardInterrupt:
+        pass
+    except Exception:
+        # foot exits with the process, taking the traceback with it. Keep a
+        # copy so a crash can actually be diagnosed afterwards.
+        import traceback
+        with open(CRASH_LOG, "a") as fh:
+            fh.write("\n=== %s ===\n" % time.strftime("%Y-%m-%d %H:%M:%S"))
+            traceback.print_exc(file=fh)
+        traceback.print_exc()
+        raise
