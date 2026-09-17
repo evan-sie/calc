@@ -2696,3 +2696,50 @@ detected -- it just stops delivering frames and has to reset itself, which is
 what makes captures take 10-26s instead of ~4s. That pattern points at the CSI
 ribbon rather than the sensor. Reseat both ends of the cable; try another
 cable before suspecting the module.
+
+## 2026-09-17 - A Busy Model No Longer Locks Out the Other
+
+### The Bug
+The execute branch opened with:
+
+```python
+if any(channels[k].status == "working" for k in (GEMINI, OPENAI_CH)):
+    continue
+```
+
+A bare `continue`, with no message. So while *either* model had a request in
+flight -- including one stuck uploading a photo over a weak link, or waiting
+out the full request timeout -- every F1 and Enter press was silently
+swallowed, on both channels. Switching to the healthy model with SYM+F2 did not
+help, because the guard looked at both. That also accounts for some of the
+"keyboard sometimes does nothing" reports: the keypress was read and discarded.
+
+### The Fix
+- Only the channel you are **looking at** can refuse, and it now says
+  `[!] GPT busy (SYM+F2)` instead of swallowing the key.
+- `channel_is_free()` gates dispatch: a model mid-request is **skipped**, not
+  waited for, so the other one still gets the question.
+- A new question clears a pending `awaiting_choice`, so an unanswered retry
+  prompt cannot wedge a channel either.
+
+One consequence worth knowing: if a model is skipped because it was busy, it
+misses that turn, and the two conversations diverge by one question. That is
+the intended trade -- being able to keep working beats keeping the transcripts
+perfectly aligned. `DIFF` can therefore briefly compare answers from different
+questions; it is a heuristic and always was.
+
+### Camera After the Ribbon Reseat: Worse, and Now Conclusive
+Before the reseat the sensor enumerated and streamed but stalled delivering
+frames. After the reseat it is not detected at all:
+
+```
+ov5647 10-0036: ov5647_read: i2c read error, reg: 300a = -5
+ov5647 10-0036: probe with driver ov5647 failed with error -5
+```
+
+`-5` is EIO: the kernel cannot read the sensor's ID register over i2c at boot.
+`rpicam-hello --list-cameras` reports `No cameras available!` and
+`vcgencmd get_camera` reports `detected=0`, where both previously succeeded.
+The Pi has rebooted since the reseat and `dtoverlay=ov5647` is still correctly
+set in `/boot/firmware/config.txt`, so this is neither a config nor a boot
+ordering problem -- it is the physical connection.

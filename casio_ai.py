@@ -1376,8 +1376,9 @@ def start_capture(width):
 
     for key in (GEMINI, OPENAI_CH):
         ch = channels[key]
-        if not ch.enabled:
+        if not channel_is_free(ch):
             continue
+        ch.awaiting_choice = False
         if ch.history:
             add_to_channel(ch, " ", width)
         ch.status = "working"
@@ -1416,13 +1417,21 @@ def tick_capture(width):
     return True
 
 
+def channel_is_free(ch):
+    """Enabled, and not already mid-request. A model still working on the last
+    question is skipped rather than blocking the other one."""
+    return ch.enabled and ch.status != "working"
+
+
 def dispatch_capture(is_f1, path, text, width):
-    """Fire every enabled channel in parallel. Each gets its own turn."""
+    """Fire every free channel in parallel. Each gets its own turn."""
     started = []
     for key in (GEMINI, OPENAI_CH):
         ch = channels[key]
-        if not ch.enabled:
+        if not channel_is_free(ch):
             continue
+        # A new question supersedes an unanswered retry prompt.
+        ch.awaiting_choice = False
         if ch.history:
             add_to_channel(ch, " ", width)
         if not is_f1:
@@ -1810,7 +1819,17 @@ def main(stdscr):
             is_f1_press = (key == curses.KEY_F1)
             if not is_f1_press and not current_input:
                 continue
-            if any(channels[k].status == "working" for k in (GEMINI, OPENAI_CH)):
+            # A busy model must not lock you out of the other one. Only the
+            # channel you are actually looking at can refuse, and it says so
+            # rather than swallowing the keypress.
+            active = channels[active_channel]
+            if active.status == "working" or (is_f1_press and pending_capture.thread):
+                peer = other_channel(active)
+                hint = " (SYM+F2)" if peer.enabled and peer.status != "working" else ""
+                parse_and_add_history(f"[!] {active.label} busy{hint}", width,
+                                      force_style=STYLES['diag_warn'])
+                chat_area_height = height - len(header_lines) - 1
+                scroll_offset = max(0, len(chat_history) - chat_area_height)
                 continue
             if not any(channels[k].enabled for k in (GEMINI, OPENAI_CH)):
                 parse_and_add_history("[!] No models on (SYM+F3)", width,
