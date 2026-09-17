@@ -250,6 +250,8 @@ KEY_MAP = {
     'I': ('(',     '('),      # ( key
     'J': (')',     ')'),      # ) key
     'K': (',',     ','),      # , key
+    'L': ('l',     '^'),      # SYM gives '^' for powers; NUM keeps the
+                              # plain pass-through gint already sent
 }
 
 # ALPHA-mode-only overrides. In ABC mode these keys emit the mapped token
