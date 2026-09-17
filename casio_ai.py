@@ -239,7 +239,7 @@ KEY_MAP = {
     'X': ('+', '"'),       # + key
     'Y': ('-', "'"),       # - key
     'Z': ('0', ' '),       # 0 key
-    '.': ('.', ','),       # . key
+    '.': ('.', '='),       # . key -- SYM gives '='; ',' has its own key (K)
 
     # Scientific-row keys: same output in NUM and SYM mode per user spec.
     'B': ('log(',  'log('),   # log key
