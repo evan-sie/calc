@@ -2743,3 +2743,62 @@ ov5647 10-0036: probe with driver ov5647 failed with error -5
 The Pi has rebooted since the reseat and `dtoverlay=ov5647` is still correctly
 set in `/boot/firmware/config.txt`, so this is neither a config nor a boot
 ordering problem -- it is the physical connection.
+
+## 2026-09-17 - F1_PROMPT Now Applies to Text Turns Too
+
+### The Bug
+`F1_PROMPT` was referenced only inside the `is_f1` branches:
+
+```python
+if is_f1:
+    parts = [F1_PROMPT, Image.open(path)]
+else:
+    parts = [text]          # no rules at all
+```
+
+A typed question was sent with **no instructions whatsoever** -- no persona, no
+output format, and crucially no "NO LATEX / NO UNICODE MATH" constraint. That
+is why Gemini reverted to LaTeX on text questions while behaving on photos.
+
+### The Fix
+The rules moved to each SDK's system-instruction slot, so they apply to every
+turn regardless of input type:
+
+- **Gemini:** `GenerateContentConfig(system_instruction=F1_PROMPT)` in
+  `new_gemini_chat()`.
+- **OpenAI:** the `instructions` parameter on `responses.create`, re-sent on
+  every call because the Responses API does not inherit instructions through
+  `previous_response_id`.
+
+The photo turn now carries only the image, since the rules are no longer part
+of the user message.
+
+That also fixes a quieter waste: the prompt used to be part of *every* photo
+message, so each captured photo appended another ~1240 tokens of prompt into
+the conversation history, which was then resent on every subsequent turn. As
+a system instruction there is exactly one copy per request instead of a copy
+per turn accumulating.
+
+### Verification
+Asked both models a text-only question ("transfer function of a
+mass-spring-damper"), which is about as tempting as it gets for LaTeX:
+
+| | LaTeX markers | unicode math | aborted re missing image |
+|---|---|---|---|
+| Gemini 3.8 Flash | none | none | no |
+| gpt-5.6-sol | none | none | no |
+
+Both produced the full `[KNOWN / GIVEN] / [FIND] / [ANALYSIS] / [FINAL ANSWER]`
+structure with plain-text math (`X(s)/F(s)=1/(m*s_squared+c*s+k)`).
+
+The prompt is written around images ("derived strictly from images of
+worksheets", an `[IMAGE ANALYSIS]` section, camera-position advice), so there
+was a real risk a text-only turn would trigger the CONDITION B abort path.
+Tested specifically: neither model did.
+
+### Known Contradiction
+The prompt still says "ONE AND DONE: You operate in a strict single-turn
+environment. You CANNOT ask follow-up questions." That was true when it was
+written; both models now hold conversation history and the class-context
+feature depends on multi-turn. Left as-is because the prompt's wording is a
+user decision, but it is worth revisiting.

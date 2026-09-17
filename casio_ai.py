@@ -267,6 +267,7 @@ def new_gemini_chat():
     return client.chats.create(
         model=MODEL_NAME,
         config=genai_types.GenerateContentConfig(
+            system_instruction=F1_PROMPT,
             thinking_config=genai_types.ThinkingConfig(
                 thinking_level=GEMINI_THINKING_LEVEL,
                 include_thoughts=True)))
@@ -1164,10 +1165,11 @@ def _gemini_request(ch, is_f1, path, text):
 
     if is_f1:
         ch.step = "UPLOADING"
+        # The rules ride on system_instruction now, so only the photo goes here.
         try:
-            parts = [F1_PROMPT, Image.open(path)]
+            parts = [Image.open(path)]
         except Exception:
-            parts = [F1_PROMPT, client.files.upload(file=path)]
+            parts = [client.files.upload(file=path)]
         ch.step = "UPLOADED"
         time.sleep(0.5)
     else:
@@ -1205,7 +1207,6 @@ def _openai_request(ch, is_f1, path, text):
         with open(path, "rb") as fh:
             b64 = base64.b64encode(fh.read()).decode("ascii")
         content = [
-            {"type": "input_text", "text": F1_PROMPT},
             {"type": "input_image", "image_url": "data:image/jpeg;base64," + b64},
         ]
         ch.step = "UPLOADED"
@@ -1224,6 +1225,9 @@ def _openai_request(ch, is_f1, path, text):
         "reasoning": {"effort": OPENAI_REASONING_EFFORT, "summary": "detailed"},
         "input": [{"role": "user", "content": content}],
         "stream": True,
+        # Re-sent every call: the Responses API does not inherit instructions
+        # through previous_response_id.
+        "instructions": F1_PROMPT,
     }
     # Chain turns server-side so the photo is not re-uploaded every message.
     if ch.prev_response_id:
