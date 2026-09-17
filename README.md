@@ -2802,3 +2802,46 @@ environment. You CANNOT ask follow-up questions." That was true when it was
 written; both models now hold conversation history and the class-context
 feature depends on multi-turn. Left as-is because the prompt's wording is a
 user decision, but it is worth revisiting.
+
+## 2026-09-17 - Resolve the Single-Turn vs History Contradiction
+
+The prompt contradicted itself once conversation memory arrived. Constraint 2
+said "You operate in a strict single-turn environment", while the
+`<session_context_reminder>` further down told the model to "RECALL YOUR CLASS
+CONTEXT: At the start of this session, you ingested course-specific..." -- one
+telling it that it has no memory, the other that it does.
+
+That matters beyond tidiness: a model told it is single-turn has reason not to
+reach for the class context it was primed with, which is the whole point of the
+notes feature.
+
+The rule Evan wants is unchanged -- never ask follow-ups -- so only the false
+justification was removed:
+
+> **NEVER ASK, ALWAYS ANSWER:** You CANNOT ask follow-up questions or request
+> clarification of any kind. Output your final response immediately, using only
+> the information you already have. You DO retain this conversation, including
+> the course context loaded at the start of the session, and you MUST use it --
+> but having that memory NEVER licenses asking a question. If something required
+> is missing or unreadable, use CONDITION B below instead of asking for it.
+
+### Verification
+Primed both models with a short throwaway course document (velocity written
+`VX`, gravity `9.79`), then in a **separate turn** asked a question with a
+required value deliberately missing -- the strongest possible pull toward a
+follow-up question:
+
+| | asked a question | used CONDITION B | remembered context |
+|---|---|---|---|
+| Gemini 3.8 Flash | no | yes | yes (`VX`) |
+| gpt-5.6-sol | no | yes | yes (`VX`) |
+
+Both correctly refused to guess, aborted through CONDITION B, and used the
+course notation -- proving memory is intact without licensing questions.
+
+### Cosmetic Leftover
+On a text-only turn the CONDITION B output still renders its
+`**[IMAGE ANALYSIS]**` heading ("No worksheet image was provided"), because
+that section is unconditional in the prompt. Harmless and the answer is still
+correct, but making that section conditional on an image actually being present
+would tidy it up.
