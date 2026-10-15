@@ -18,7 +18,7 @@ Headless Sway (Wayland) -> wayvnc -> cgvm_vnc bridge -> USB -> Calculator Screen
 - **VNC:** wayvnc on HEADLESS-1 output
 - **Terminal:** foot (app_id="foot")
 - **AI Interface:** Python curses app (`casio_ai.py`)
-- **AI Backend:** Google Gemini API
+- **AI Backend:** OpenAI Responses API, `gpt-6.1-sol`, reasoning effort `high`
 
 ## Key Files
 - `/root/casio_ai.py` - Main AI interface
@@ -29,9 +29,6 @@ Headless Sway (Wayland) -> wayvnc -> cgvm_vnc bridge -> USB -> Calculator Screen
 ## Controls
 - **F1:** Capture photo and send to AI for analysis
 - **SYM+F1:** Toggle viewfinder (camera preview)
-- **SYM+F2:** Switch between the Gemini and OpenAI views
-- **SYM+F3:** Re-enable a model you stopped after a failure
-- **SYM+F5:** Ask OpenAI whether the two answers agree
 - **F2:** Toggle the splashscreen (controls + keyboard map)
 - **F3:** Clear input buffer
 - **F4:** Toggle SHIFT mode (symbols)
@@ -39,6 +36,19 @@ Headless Sway (Wayland) -> wayvnc -> cgvm_vnc bridge -> USB -> Calculator Screen
 - **F6:** Restart the AI interface
 - **Enter:** Send text query to AI
 - **Up/Down:** Scroll chat history
+
+GPT is the only model. The toolbar shows mode, CPU temperature, RAM, Wi-Fi
+SSID/dBm, GPT health (green/amber/red), and the clock on one row. While GPT is
+working, its newest available reasoning-summary heading replaces the purple
+`[*]` status text with animated dots. The status line disappears when the
+answer arrives. Summaries may be absent on some requests.
+
+Choose a class at startup and confirm with Enter to load the notes. Notes,
+photos, and follow-up messages use one conversation for the program session.
+After one automatic retry, a failed request offers Enter to retry or F3 to
+dismiss; dismissing preserves the conversation and allows another question.
+
+The development log below includes historical configurations and controls.
 
 ## Keyboard Modes
 The toolbar shows the current input mode:
@@ -2845,3 +2855,31 @@ On a text-only turn the CONDITION B output still renders its
 that section is unconditional in the prompt. Harmless and the answer is still
 correct, but making that section conditional on an image actually being present
 would tidy it up.
+
+## 2026-10-15 - GPT-6.1 Sol Only
+
+The calculator now uses only `gpt-6.1-sol` at reasoning effort `high` via the
+Responses API. Gemini, the second chat, switching, comparison requests, and the
+DIFF marker have been removed. The installer now requires only `openai` for
+AI access, and the key remains in `/root/.casio_ai.env`.
+
+One conversation holds the selected course notes, captured images, and text
+follow-ups. Instructions are included on each request and successful turns
+chain with `previous_response_id`. Broken or incomplete streams do not advance
+that chain. One automatic retry is followed by Enter to retry or F3 to dismiss;
+dismissing a request preserves the conversation and allows a new question.
+
+The compact toolbar retains GPT health and the clock. Reasoning-summary headings
+replace one another in the single purple status line with animated dots, then
+are removed when the answer arrives. The viewfinder, camera timeout, upload
+resizing, keyboard mappings, and live IP on F2 remain available.
+
+Nine offline regression tests passed on the Pi, covering conversation chaining
+from notes through photos and follow-ups, retries and dismissal, failed streams,
+camera errors, busy-state guards, the thinking line, and toolbar health colours.
+All API responses were mocked and network connections blocked during tests.
+No paid generation or full-course-notes test was run for this change.
+
+MECH4310 remains installed. MECH3381 will be added to the separate notes repo
+when the course reference is supplied. A code/configuration rollback archive
+was saved on the Pi before deployment under `/root/calc-backups/`.

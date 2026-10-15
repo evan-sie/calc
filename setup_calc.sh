@@ -5,8 +5,8 @@ echo "Step 2: Install Python packages"
 # We use --break-system-packages because DietPi is Debian-based and we are running as root.
 # Alternatively, we could create a venv, but the user said "Prefer apt packages where available... but make Python imports work".
 # We already installed python3-pil, python3-opencv, python3-numpy via apt.
-# google-genai is not in apt, so we use pip.
-pip3 install --break-system-packages google-genai openai
+# Install the OpenAI SDK for the GPT-only interface.
+pip3 install --break-system-packages openai
 
 echo "Step 3: Clone repo"
 rm -rf /root/calc

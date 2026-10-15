@@ -41,15 +41,14 @@ systemctl daemon-reload
 systemctl enable cyberdeck.service wifi-ensure.service
 ```
 
-## API Keys
+## OpenAI API Key
 
-Keys are not in the source and never committed. `casio_ai.py` reads them from
+The key is not in the source and never committed. `casio_ai.py` reads it from
 `/root/.casio_ai.env`, which you must create by hand after a restore:
 
 ```bash
 cat > /root/.casio_ai.env <<'EOF'
 # API keys for casio_ai.py. Never commit this file.
-GEMINI_API_KEY=your-gemini-key-here
 OPENAI_API_KEY=your-openai-key-here
 EOF
 chmod 600 /root/.casio_ai.env
@@ -58,6 +57,10 @@ chmod 600 /root/.casio_ai.env
 A real environment variable of the same name takes precedence over the file.
 If a key is missing, the deck still starts and says so in the chat rather than
 failing silently.
+
+The only backend is `gpt-6.1-sol` at reasoning effort `high`, using the OpenAI
+Responses API. Install the `openai` Python package; `google-genai` is no longer
+needed. Existing `GEMINI_API_KEY` entries are ignored.
 
 ## Class Notes
 
@@ -69,6 +72,26 @@ git clone https://github.com/evan-sie/casio-notes.git /root/notes
 ```
 
 Without it the class selector has nothing to list.
+
+Select a class at startup, then press Enter to load its notes into the GPT
+conversation (or F2 to skip). Photos and text follow-ups continue that same
+conversation. A program restart starts a fresh conversation, so load the notes
+again. MECH4310 is currently installed; add `MECH3381.md` to this notes repo
+when its course reference is ready to make it appear in the selector.
+
+`previous_response_id` preserves conversation context, but earlier context can
+still be billed as input or cached input on subsequent requests.
+
+## Offline Verification
+
+From the repo, with the runtime Python dependencies installed:
+
+```bash
+python3 -m unittest discover -s tests -v
+```
+
+The tests simulate OpenAI responses and block network connections. They do not
+capture photos, load real course notes into a model, or spend API credits.
 
 ## DietPi Settings To Reapply
 
