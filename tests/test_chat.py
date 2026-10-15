@@ -8,6 +8,7 @@ from pathlib import Path
 import socket
 import sys
 import tempfile
+import threading
 import time
 from types import SimpleNamespace as NS
 import unittest
@@ -32,11 +33,15 @@ class ChatTests(unittest.TestCase):
         self.calls = []
         self.failures = 0
         self.bad_stream = None
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.trace = Path(self.temp.name) / 'status.json'
         self.client = NS(responses=NS(create=self.create_response))
         patches = [
             patch.object(app, 'OpenAI', return_value=self.client),
             patch.object(app, 'OPENAI_API_KEY', 'offline-test-placeholder'),
             patch.object(app, 'check_viewfinder_alive', return_value=False),
+            patch.object(app, 'REQUEST_STATUS_LOG', str(self.trace)),
             patch.object(socket.socket, 'connect', side_effect=AssertionError('Network forbidden in tests')),
         ]
         for item in patches:
@@ -49,7 +54,7 @@ class ChatTests(unittest.TestCase):
             self.failures -= 1
             raise ConnectionError('simulated connection failure')
         if self.bad_stream is not None:
-            return iter(self.bad_stream)
+            return self.bad_stream if hasattr(self.bad_stream, 'close') else iter(self.bad_stream)
         return iter([
             event('response.reasoning_summary_text.delta', delta='**Checking units** prose'),
             event('response.output_text.delta', delta='Context or answer'),
@@ -142,8 +147,9 @@ class ChatTests(unittest.TestCase):
     def test_thinking_is_one_line_replaces_header_and_reserves_dots(self):
         app.chat.step = 'WAITING'
         app.chat.wait_start = time.time()
-        app.note_thought(app.chat, 'Prose without a heading')
-        self.assertEqual(app.chat.thought_label, '')
+        app.note_thought(app.chat, 'Checking the formula without a heading')
+        self.assertTrue(app.chat.thought_label.startswith('Checking the formula'))
+        app.chat.thought = app.chat.thought_label = ''
         app.note_thought(app.chat, '**Reading the dia')
         self.assertEqual(app.chat.thought_label, '')
         app.note_thought(app.chat, 'gram** more prose')
@@ -157,6 +163,172 @@ class ChatTests(unittest.TestCase):
         self.assertTrue(text.endswith('...'))
         self.assertLessEqual(len(text), 29)
         self.assertNotIn('prose', text)
+
+    def test_summary_formats_and_part_boundaries(self):
+        for index, (text, expected) in enumerate([
+            ('**Checking the diagram**\n\nProse', 'Checking the diagram'),
+            ('## Applying the formula\n\nProse', 'Applying the formula'),
+            ('Checking units before solving.', 'Checking units before solving.'),
+        ]):
+            with self.subTest(text=text):
+                app.handle_summary_event(app.chat, event(
+                    'response.reasoning_summary_text.delta', item_id='r1',
+                    summary_index=index, delta=text))
+                self.assertEqual(app.chat.thought_label, expected)
+        app.handle_summary_event(app.chat, event(
+            'response.reasoning_summary_text.done', item_id='r1', summary_index=2,
+            text='Checking units before solving.'))
+        self.assertEqual(app.chat.thought, 'Checking units before solving.')
+
+    def test_summary_done_events_are_consumed_without_deltas(self):
+        self.bad_stream = [
+            event('response.reasoning_summary_text.done', text='Checking the equation'),
+            event('response.reasoning_summary_part.done',
+                  part=NS(text='## Verifying units')),
+            event('response.output_text.delta', delta='Final answer'),
+            event('response.completed', response=NS(id='resp_test', usage=None)),
+        ]
+        app.send_message('Question', 70)
+        self.pump()
+        self.assertEqual(app.chat.thought_label, 'Verifying units')
+        self.assertEqual(app.chat.answer, 'Final answer')
+
+    def test_answer_cannot_be_misclassified_as_thinking(self):
+        self.bad_stream = [
+            event('response.output_item.done', item=NS(type='message',
+                  summary=[NS(text='**Not reasoning**')])),
+            event('response.output_text.delta', delta='**FINAL ANSWER** 42'),
+            event('response.completed', response=NS(id='resp_answer', usage=None)),
+        ]
+        app.send_message('Question', 70)
+        self.pump()
+        self.assertEqual(app.chat.thought, '')
+        self.assertEqual(app.chat.thought_label, '')
+        self.assertEqual(app.chat.answer, '**FINAL ANSWER** 42')
+        import json
+        record = json.loads(self.trace.read_text())
+        self.assertFalse(record['summary_received'])
+        self.assertNotIn('FINAL ANSWER', self.trace.read_text())
+        self.assertNotIn('Question', self.trace.read_text())
+
+    def test_reasoning_item_snapshot_is_separate_from_answer(self):
+        self.bad_stream = [
+            event('response.output_item.done', item=NS(type='reasoning', id='r1',
+                  summary=[NS(text='Checking dimensions')])),
+            event('response.output_text.delta', delta='Result: 12'),
+            event('response.completed', response=NS(id='resp_snapshot', usage=None)),
+        ]
+        app.send_message('Question', 70)
+        self.pump()
+        self.assertEqual(app.chat.thought_label, 'Checking dimensions')
+        self.assertEqual(app.chat.answer, 'Result: 12')
+
+    def test_cancel_closes_stream_without_retry_or_history_advance(self):
+        entered = threading.Event()
+        closed = threading.Event()
+
+        class BlockingStream:
+            def __iter__(self):
+                yield event('response.reasoning_summary_text.delta', delta='**Checking units**')
+                entered.set()
+                if not closed.wait(2):
+                    raise AssertionError('Stop did not close stream')
+                # Simulate late events already buffered when Stop was pressed.
+                yield event('response.output_text.delta', delta='Late answer')
+                yield event('response.completed', response=NS(id='must_not_chain', usage=None))
+
+            def close(self):
+                closed.set()
+
+        self.bad_stream = BlockingStream()
+        app.chat.prev_response_id = 'previous_good_turn'
+        app.send_message('Stop this question', 70)
+        self.assertTrue(entered.wait(1))
+        self.assertTrue(app.cancel_request())
+        self.pump()
+        self.assertTrue(closed.is_set())
+        self.assertEqual(len(self.calls), 1)
+        self.assertEqual(app.chat.prev_response_id, 'previous_good_turn')
+        self.assertEqual(app.chat.status, 'idle')
+        self.assertIsNone(app.chat.answer)
+        self.assertFalse(app.chat.awaiting_choice)
+        self.assertFalse(any('Late answer' in t for line in app.chat_history for t, _ in line))
+        self.bad_stream = None
+        app.send_message('Next question', 70)
+        self.pump()
+        self.assertEqual(self.calls[-1]['previous_response_id'], 'previous_good_turn')
+
+    def test_cancel_during_upload_closes_client_and_allows_fresh_client(self):
+        entered = threading.Event()
+        closed = threading.Event()
+
+        def upload(**kwargs):
+            self.calls.append(kwargs)
+            entered.set()
+            if not closed.wait(2):
+                raise AssertionError('Stop did not close client')
+            raise ConnectionError('upload closed')
+
+        self.client.responses.create = upload
+        self.client.close = closed.set
+        app.chat.prev_response_id = 'old_context'
+        app.send_message('Cancel during request setup', 70)
+        self.assertTrue(entered.wait(1))
+        self.assertTrue(app.cancel_request())
+        self.pump()
+        self.assertEqual(app.chat.status, 'idle')
+        self.assertIsNone(app.chat.session)
+        self.assertEqual(app.chat.prev_response_id, 'old_context')
+        self.assertEqual(len(self.calls), 1)
+        self.client.responses.create = self.create_response
+        app.send_message('Try again', 70)
+        self.pump()
+        self.assertEqual(app.chat.status, 'idle')
+
+    def test_cancel_during_camera_capture_never_uploads(self):
+        entered = threading.Event()
+        finish = threading.Event()
+
+        def capture(cap):
+            entered.set()
+            finish.wait(2)
+            cap.path = '/tmp/not-sent.jpg'
+
+        with patch.object(app, '_run_capture', side_effect=capture):
+            app.start_capture(70)
+            self.assertTrue(entered.wait(1))
+            app.cancel_request()
+            finish.set()
+            self.pump()
+        self.assertEqual(self.calls, [])
+        self.assertEqual(app.chat.status, 'idle')
+
+    def test_stop_wins_race_with_response_completion(self):
+        app.chat.prev_response_id = 'previous_good_turn'
+        app.chat.pending = (False, None, 'Question')
+
+        def finish(ch, *args):
+            ch.completed_response = NS(id='late_response', usage=None)
+            ch.cancel_event.set()
+            return 'Late answer'
+
+        with patch.object(app, '_openai_request', side_effect=finish):
+            app._run_request(app.chat)
+        self.assertEqual(app.chat.status, 'cancelled')
+        self.assertIsNone(app.chat.answer)
+        self.assertEqual(app.chat.prev_response_id, 'previous_good_turn')
+
+    def test_stop_shuts_down_socket_before_closing_stream(self):
+        actions = []
+        sock = NS(shutdown=lambda how: actions.append(('shutdown', how)))
+        transport = NS(get_extra_info=lambda key: sock if key == 'socket' else None)
+        app.chat.stream = NS(response=NS(extensions={'network_stream': transport}),
+                             close=lambda: actions.append(('close', None)))
+        app.chat.status = 'working'
+        app.chat.thread = NS(is_alive=lambda: True)
+        self.assertTrue(app.cancel_request())
+        app.chat.cancel_thread.join(1)
+        self.assertEqual(actions, [('shutdown', socket.SHUT_RDWR), ('close', None)])
 
     def test_camera_failure_does_not_send_api_request(self):
         app.chat.prev_response_id = 'notes_context'

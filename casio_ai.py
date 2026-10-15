@@ -5,6 +5,7 @@ import re
 import time
 import threading
 import signal
+import socket
 import base64
 import json
 from PIL import Image
@@ -55,6 +56,8 @@ CAPTURE_TIMEOUT_SEC = 30
 # Stop waiting on an API call rather than hanging on a half-open socket when
 # the hotspot drops. The SDK defaults to minutes.
 REQUEST_TIMEOUT_SEC = 120
+# Per-request counters only: no prompts, images, answers, keys, or summary text.
+REQUEST_STATUS_LOG = "/tmp/casio_ai_request_status.json"
 
 # Longest edge for the uploaded photo. The full 2592x1944 frame is ~950KB,
 # which is painful on a flaky 2.4GHz link. 2048 keeps roughly 240 px/inch on a
@@ -266,6 +269,12 @@ class ChatState:
         self.error = None
         self.thread = None
         self.session = None       # OpenAI client, created on the first request
+        self.stream = None
+        self.completed_response = None
+        self.cancel_event = threading.Event()
+        self.cancel_thread = None
+        self.session_needs_reset = False
+        self.request_lock = threading.Lock()
         self.prev_response_id = None   # OpenAI conversation chaining
         self.retries = 0
         self.pending = None       # (is_f1, path, text) for a retry
@@ -274,6 +283,7 @@ class ChatState:
         self.last_usage = None    # token usage of the last call, if reported
         self.thought = ""         # provider's streamed reasoning summary
         self.thought_label = ""   # newest **header** from it, for the status line
+        self.thought_part = None  # (reasoning item id, summary index)
         self.live_len = 0         # lines the in-flight block currently occupies
 
     @property
@@ -702,7 +712,7 @@ def get_startup_splash_lines():
         "F6      Restart program  (press 2x)",
         "",
         "Enter   Send text message",
-        "F3      Clear input buffer",
+        "F3      Clear input / stop request",
         "Up/Down Scroll chat history",
         "",
         "RSSI    [[[G]]-30[[/G]], [[R]]-90[[/R]]] dBm",
@@ -983,6 +993,8 @@ def toggle_viewfinder(width):
 def format_request_status(ch):
     """Status line text for the current GPT request."""
     step = ch.step
+    if step == "CANCELLING":
+        return "[*] Stopping request"
     if step == "CAPTURING":
         return "[*] Capturing"
     if step == "UPLOADING":
@@ -1006,23 +1018,95 @@ def format_request_status(ch):
 # --- OPENAI REQUESTS ---------------------------------------------------------
 
 _THOUGHT_HEADER_RE = re.compile(r"\*\*(.+?)\*\*")
+_THOUGHT_MARKDOWN_RE = re.compile(r"^#{1,6}[ \t]+(.+)$", re.MULTILINE)
 
 
-def note_thought(ch, text):
-    """Show only the latest complete bold heading from the provider's summary.
+def note_thought(ch, text, part=None, replace=False):
+    """Use the provider's summary regardless of its Markdown formatting.
 
-    Summaries are optional. Until a heading arrives the status remains
-    'GPT thinking'; prose is never substituted for a heading.
+    Prefer a title; otherwise use a short excerpt of the latest paragraph on
+    the same status line. Separate summary parts must not inherit old titles.
+    A done event replaces its deltas rather than duplicating them.
     """
     if not text:
         return
-    ch.thought += text
+    if part is not None and part != ch.thought_part:
+        ch.thought = ""
+        ch.thought_label = ""
+        ch.thought_part = part
+    ch.thought = text if replace else ch.thought + text
     headers = _THOUGHT_HEADER_RE.findall(ch.thought)
     if headers:
-        ch.thought_label = " ".join(headers[-1].split())[:32]
+        label = headers[-1]
+    else:
+        headings = _THOUGHT_MARKDOWN_RE.findall(ch.thought)
+        if headings:
+            label = headings[-1]
+        else:
+            paragraph = re.split(r"\n\s*\n", ch.thought.strip())[-1]
+            # Wait for a split bold title to close instead of showing its '*'.
+            if paragraph.startswith("**") and "**" not in paragraph[2:]:
+                return
+            label = re.sub(r"^[\s#>*_-]+", "", paragraph)
+    ch.thought_label = " ".join(label.replace("**", "").split())[:32]
+
+
+def handle_summary_event(ch, event):
+    """Consume deltas and authoritative text/part snapshots from Responses."""
+    kind = getattr(event, "type", "")
+    part = (getattr(event, "item_id", ""), getattr(event, "summary_index", 0))
+    if kind == "response.reasoning_summary_text.delta":
+        text = getattr(event, "delta", "") or ""
+        note_thought(ch, text, part=part)
+    elif kind == "response.reasoning_summary_text.done":
+        text = getattr(event, "text", "") or ""
+        note_thought(ch, text, part=part, replace=True)
+    elif kind in ("response.reasoning_summary_part.added",
+                  "response.reasoning_summary_part.done"):
+        text = getattr(getattr(event, "part", None), "text", "") or ""
+        note_thought(ch, text, part=part, replace=True)
+    elif kind in ("response.output_item.added", "response.output_item.done"):
+        item = getattr(event, "item", None)
+        if getattr(item, "type", "") != "reasoning":
+            return False
+        for index, summary in enumerate(getattr(item, "summary", None) or []):
+            text = getattr(summary, "text", "") or ""
+            note_thought(ch, text, part=(getattr(item, "id", ""), index), replace=True)
+        return bool(ch.thought)
+    else:
+        return False
+    return bool(text)
+
+
+def write_request_status(ch, counts, started, completed):
+    """Record whether a real request supplied summaries without logging content."""
+    usage = getattr(completed, "usage", None)
+    details = getattr(usage, "output_tokens_details", None)
+    record = {
+        "model": OPENAI_MODEL_NAME,
+        "effort": OPENAI_REASONING_EFFORT,
+        "elapsed_seconds": round(time.time() - started, 1),
+        "completed": completed is not None,
+        "cancel_requested": ch.cancel_event.is_set(),
+        "event_counts": counts,
+        "summary_received": bool(ch.thought),
+        "summary_label_available": bool(ch.thought_label),
+        "reasoning_tokens": getattr(details, "reasoning_tokens", None),
+    }
+    try:
+        with open(REQUEST_STATUS_LOG, "w") as fh:
+            json.dump(record, fh)
+    except OSError:
+        pass
+
+
+class RequestCancelled(Exception):
+    """The user stopped this request; it must not be retried or enter history."""
 
 
 def _openai_request(ch, is_f1, path, text):
+    if ch.cancel_event.is_set():
+        raise RequestCancelled()
     if OpenAI is None:
         raise RuntimeError("openai package not installed")
     if not OPENAI_API_KEY:
@@ -1044,14 +1128,15 @@ def _openai_request(ch, is_f1, path, text):
     else:
         content = [{"type": "input_text", "text": text}]
 
+    if ch.cancel_event.is_set():
+        raise RequestCancelled()
     ch.wait_start = time.time()
     ch.step = "WAITING"
     kwargs = {
         "model": OPENAI_MODEL_NAME,
-        # "auto" silently returned no summary at all on image requests -- the model
-        # reasoned for hundreds of tokens and reported none of it. "detailed"
-        # asks explicitly, and still stays quiet when there is nothing to think
-        # about, which is the behaviour we want.
+        # Request the provider's reasoning summaries explicitly. They are
+        # separate from answer text and may be absent even when reasoning
+        # tokens were used; summary formatting is not guaranteed.
         "reasoning": {"effort": OPENAI_REASONING_EFFORT, "summary": "detailed"},
         "input": [{"role": "user", "content": content}],
         "stream": True,
@@ -1065,24 +1150,45 @@ def _openai_request(ch, is_f1, path, text):
 
     answer = []
     completed = None
-    for event in ch.session.responses.create(**kwargs):
-        etype = getattr(event, "type", "") or ""
-        if etype.endswith("reasoning_summary_text.delta"):
-            note_thought(ch, getattr(event, "delta", "") or "")
-        elif etype.endswith("output_text.delta"):
-            answer.append(getattr(event, "delta", "") or "")
-        elif etype == "response.completed":
-            completed = event.response
-        elif etype in ("response.failed", "response.incomplete", "error"):
-            raise RuntimeError("GPT response failed or was incomplete; retry the request")
+    counts = {}
+    started = time.time()
+    stream = None
+    try:
+        stream = ch.session.responses.create(**kwargs)
+        ch.stream = stream
+        if ch.cancel_event.is_set():
+            raise RequestCancelled()
+        for event in stream:
+            if ch.cancel_event.is_set():
+                raise RequestCancelled()
+            etype = getattr(event, "type", "") or ""
+            counts[etype] = counts.get(etype, 0) + 1
+            if (etype.startswith("response.reasoning_summary_")
+                    or etype in ("response.output_item.added", "response.output_item.done")):
+                handle_summary_event(ch, event)
+            elif etype == "response.output_text.delta":
+                answer.append(getattr(event, "delta", "") or "")
+            elif etype == "response.completed":
+                completed = event.response
+            elif etype in ("response.failed", "response.incomplete", "error"):
+                raise RuntimeError("GPT response failed or was incomplete; retry the request")
+    finally:
+        if stream is not None:
+            try:
+                stream.close()
+            except Exception:
+                pass
+        ch.stream = None
+        write_request_status(ch, counts, started, completed)
 
+    if ch.cancel_event.is_set():
+        raise RequestCancelled()
     text = "".join(answer)
     if completed is None or not text.strip():
         raise RuntimeError("GPT stream ended without a complete answer; retry the request")
-    # Commit conversation state only after a successful response. A failed
-    # stream retries against the same prior turn rather than losing context.
-    ch.prev_response_id = completed.id
-    ch.last_usage = getattr(completed, "usage", None)
+    # The worker commits this under request_lock so Stop and completion cannot
+    # race to advance the conversation in opposite ways.
+    ch.completed_response = completed
     return text
 
 
@@ -1102,11 +1208,67 @@ def _run_request(ch):
     """Worker body. Never touches curses -- only conversation state."""
     is_f1, path, text = ch.pending
     try:
-        ch.answer = _openai_request(ch, is_f1, path, text)
-        ch.status = "done"
+        answer = _openai_request(ch, is_f1, path, text)
     except Exception as e:
-        ch.error = _short_error(e)
-        ch.status = "error"
+        with ch.request_lock:
+            if ch.cancel_event.is_set():
+                ch.answer = None
+                ch.status = "cancelled"
+            else:
+                ch.error = _short_error(e)
+                ch.status = "error"
+    else:
+        with ch.request_lock:
+            if ch.cancel_event.is_set():
+                ch.answer = None
+                ch.status = "cancelled"
+            else:
+                ch.prev_response_id = ch.completed_response.id
+                ch.last_usage = getattr(ch.completed_response, "usage", None)
+                ch.answer = answer
+                ch.status = "done"
+
+
+def cancel_request():
+    """Stop the active synchronous stream without blocking the UI thread."""
+    with chat.request_lock:
+        if chat.status != "working":
+            return False
+        if chat.cancel_event.is_set():
+            return True
+        chat.cancel_event.set()
+        chat.step = "CANCELLING"
+        if chat.thread is not None:
+            stream, session = chat.stream, chat.session
+            # If the upload has not returned a stream yet, close its HTTP
+            # client. A fresh client is needed for the next request.
+            if stream is None:
+                chat.session_needs_reset = True
+
+            def close_connection():
+                try:
+                    if stream is not None:
+                        # close() alone can leave another thread blocked in
+                        # recv until the next chunk. Shutdown wakes that read
+                        # immediately, then normal SDK cleanup releases it.
+                        response = getattr(stream, "response", None)
+                        transport = getattr(response, "extensions", {}).get("network_stream")
+                        if transport is not None:
+                            try:
+                                sock = transport.get_extra_info("socket")
+                                if sock is not None:
+                                    sock.shutdown(socket.SHUT_RDWR)
+                            except (AttributeError, OSError):
+                                pass
+                        stream.close()
+                    elif session is not None:
+                        session.close()
+                except Exception:
+                    pass
+
+            chat.cancel_thread = threading.Thread(target=close_connection, daemon=True)
+            chat.cancel_thread.start()
+    return True
 
 
 def render_live_block(ch, width):
@@ -1135,8 +1297,12 @@ def launch_request(ch, width):
     ch.step = "UPLOADING" if ch.pending[0] else "WAITING"
     ch.answer = None
     ch.error = None
+    ch.completed_response = None
+    ch.cancel_event.clear()
+    ch.cancel_thread = None
     ch.thought = ""
     ch.thought_label = ""
+    ch.thought_part = None
     ch.awaiting_choice = False
     ch.status_index = len(ch.history)
     ch.live_len = 0
@@ -1160,7 +1326,7 @@ pending_capture = PendingCapture()
 def chat_is_busy():
     # A finished worker must be reaped before another request can replace its
     # status block, even if a key arrives before the next idle UI tick.
-    return (chat.status == "working" or chat.thread is not None
+    return (chat.status == "working" or chat.thread is not None or chat.cancel_thread is not None
             or pending_capture.thread is not None)
 
 
@@ -1223,6 +1389,7 @@ def start_capture(width):
     cap = pending_capture
     cap.error = None
     cap.path = None
+    chat.cancel_event.clear()
     chat.awaiting_choice = False
     if chat.history:
         parse_and_add_history(" ", width)
@@ -1247,7 +1414,10 @@ def tick_capture(width):
     chat.status_index = None
     chat.live_len = 0
     chat.status = "idle"
-    if cap.error:
+    if chat.cancel_event.is_set():
+        parse_and_add_history("[*] Capture stopped; photo not sent.", width,
+                              force_style=STYLES['hint'])
+    elif cap.error:
         parse_and_add_history(f"Cam Fail: {cap.error}", width,
                               force_style=STYLES['diag_crit'])
     else:
@@ -1286,14 +1456,26 @@ def tick_request(width):
         if throbber_tick % THROBBER_TICKS_PER_FRAME == 0:
             dirty = True
 
-    if chat.thread is not None and not chat.busy and chat.status in ("done", "error"):
+    closing = chat.cancel_thread is not None and chat.cancel_thread.is_alive()
+    if (chat.thread is not None and not chat.busy and not closing
+            and chat.status in ("done", "error", "cancelled")):
         dirty = True
         replace_live_block(chat, [])
         chat.status_index = None
         chat.live_len = 0
         chat.thread = None
+        chat.cancel_thread = None
+        if chat.session_needs_reset:
+            chat.session = None
+            chat.session_needs_reset = False
         if chat.status == "done":
             parse_and_add_history(f"GPT: {chat.answer}", width)
+            chat.status = "idle"
+        elif chat.status == "cancelled":
+            chat.answer = None
+            chat.awaiting_choice = False
+            parse_and_add_history("[*] Request stopped.", width,
+                                  force_style=STYLES['hint'])
             chat.status = "idle"
         else:
             _handle_request_error(width)
@@ -1513,6 +1695,13 @@ def main(stdscr):
                 continue
             else:
                 continue
+
+        # F3 stops an active request; when idle it still clears typed input.
+        if key == curses.KEY_F3 and cancel_request():
+            sym_active = False
+            refresh_model_header()
+            force_redraw = True
+            continue
 
         # --- RETRY / DISMISS PROMPT ---
         if handle_retry_choice(key, width):

@@ -93,6 +93,23 @@ python3 -m unittest discover -s tests -v
 The tests simulate OpenAI responses and block network connections. They do not
 capture photos, load real course notes into a model, or spend API credits.
 
+## Request Status and Stop
+
+F3 stops an active request, retaining earlier conversation history. When idle,
+F3 clears input. While stopping, the UI remains responsive but waits for the
+old worker/connection to finish before accepting another request. Processing
+already performed by the provider may still be billed.
+
+Only OpenAI reasoning-summary events feed the thinking status. Answer events
+feed the final answer regardless of whether that answer contains Markdown
+headings. If the provider omits summaries, the status remains `GPT thinking`.
+
+After a request, `/tmp/casio_ai_request_status.json` records event counts,
+whether a summary arrived, and available reasoning-token usage. It is
+overwritten per attempt and contains no prompts, images, keys, answers, or
+summary text. This distinguishes missing provider summaries from display
+problems using a normal request rather than paid diagnostic generations.
+
 ## DietPi Settings To Reapply
 
 The README log notes these settings were important on DietPi:

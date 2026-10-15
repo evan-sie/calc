@@ -30,7 +30,7 @@ Headless Sway (Wayland) -> wayvnc -> cgvm_vnc bridge -> USB -> Calculator Screen
 - **F1:** Capture photo and send to AI for analysis
 - **SYM+F1:** Toggle viewfinder (camera preview)
 - **F2:** Toggle the splashscreen (controls + keyboard map)
-- **F3:** Clear input buffer
+- **F3:** Stop an active request; clear input when idle
 - **F4:** Toggle SHIFT mode (symbols)
 - **F5:** Toggle NUM/ALPHA mode (numbers vs letters)
 - **F6:** Restart the AI interface
@@ -40,13 +40,19 @@ Headless Sway (Wayland) -> wayvnc -> cgvm_vnc bridge -> USB -> Calculator Screen
 GPT is the only model. The toolbar shows mode, CPU temperature, RAM, Wi-Fi
 SSID/dBm, GPT health (green/amber/red), and the clock on one row. While GPT is
 working, its newest available reasoning-summary heading replaces the purple
-`[*]` status text with animated dots. The status line disappears when the
-answer arrives. Summaries may be absent on some requests.
+`[*]` status text with animated dots. Summaries without a heading use a short
+excerpt on the same line. Answer text is handled separately and never treated
+as reasoning. The status line disappears when the answer arrives. Summaries
+may be absent on some requests, even when the model uses reasoning tokens.
 
 Choose a class at startup and confirm with Enter to load the notes. Notes,
 photos, and follow-up messages use one conversation for the program session.
 After one automatic retry, a failed request offers Enter to retry or F3 to
 dismiss; dismissing preserves the conversation and allows another question.
+F3 during a request closes the active connection, suppresses automatic retry,
+and discards late output while retaining the earlier successful conversation.
+It does not refund tokens already processed. During camera capture, Stop lets
+the bounded capture finish but prevents its photo from being uploaded.
 
 The development log below includes historical configurations and controls.
 
@@ -2883,3 +2889,27 @@ No paid generation or full-course-notes test was run for this change.
 MECH4310 remains installed. MECH3381 will be added to the separate notes repo
 when the course reference is supplied. A code/configuration rollback archive
 was saved on the Pi before deployment under `/root/calc-backups/`.
+
+## 2026-10-15 - Summary Parsing and F3 Stop
+
+Thinking status is sourced exclusively from Responses reasoning-summary events
+and reasoning-item summary snapshots. Previously the renderer discarded every
+summary without literal `**bold headings**`; it now accepts Markdown headings
+and a short excerpt when the provider supplies untitled summary text. New
+summary parts replace earlier titles, and done snapshots replace their deltas.
+Final answer events never enter the summary parser, including bold answer text.
+The API may still omit summaries despite using reasoning tokens.
+
+F3 stops the current request, closes its connection, and suppresses retry and
+late output. Earlier successful conversation history is retained. Socket
+shutdown wakes a blocked streaming read before normal SDK cleanup: a real-SDK
+test against a silent server on the Pi's loopback interface stopped in 0.04s.
+Stopping during camera capture prevents the eventual image from being sent.
+Tokens processed before cancellation can still be billed.
+
+Request event counts and summary-presence flags are written to
+`/tmp/casio_ai_request_status.json` without any prompt, image, response, key, or
+summary contents. These counters can diagnose a normal request with no extra
+model calls. Eighteen offline regression tests cover summary/answer separation,
+summary formats and snapshots, cancellation, late completion, retry behavior,
+and the existing notes/photo/history path. No paid model test was run.
