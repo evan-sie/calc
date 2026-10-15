@@ -30,4 +30,4 @@ for_window [app_id="mpv"] {
 
 no_focus [app_id="mpv"]
 
-exec foot -a foot -e python3 /root/casio_ai.py
+exec foot -a foot -e /root/run_ai.sh

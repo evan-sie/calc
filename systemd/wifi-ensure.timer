@@ -1,0 +1,11 @@
+[Unit]
+Description=Keep checking calculator WiFi, including after boot
+
+[Timer]
+OnBootSec=25
+OnUnitInactiveSec=20
+AccuracySec=2
+Unit=wifi-ensure.service
+
+[Install]
+WantedBy=timers.target

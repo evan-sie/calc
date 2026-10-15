@@ -2913,3 +2913,37 @@ summary contents. These counters can diagnose a normal request with no extra
 model calls. Eighteen offline regression tests cover summary/answer separation,
 summary formats and snapshots, cancellation, late completion, retry behavior,
 and the existing notes/photo/history path. No paid model test was run.
+
+## 2026-10-15 - Offline Network Menu and Recovery
+
+The Pi's `wifi-ensure.service` was installed but disabled. The successful boot
+authenticated to Rawon at about 11 seconds and received its DHCP lease at 47
+seconds. Previous failed boots could not be examined because DietPi kept logs
+only in RAM. No undervoltage/throttling was reported on the inspected boot.
+The exact cause of the two failed starts remains unproven.
+
+The uninterruptible startup IP wait is removed. F4 then F2 opens the Wi-Fi menu,
+including during class-context confirmation. It lists saved profiles, current
+IP, association state, and cached signal levels. Enter connects, F1 reconnects,
+F5 scans, and F2 immediately returns/continues offline. Network work runs off
+the curses thread and does not reset the chat. Offline startup offers the menu
+after closing help. The live 17-row display still shows the IP in help.
+
+The original ifupdown/WPA configuration, DHCP boot path, passwords, certificate
+settings, and enabled iPhone/Rawon profiles are preserved. Manual selection
+temporarily raises a profile's priority without disabling fallback networks
+or saving config changes. A separate systemd DHCP unit obtains the new subnet's
+lease without tying the DHCP process lifetime to the calculator terminal.
+
+`wifi-ensure.timer` checks every 20 seconds. Healthy Wi-Fi is left alone;
+failures receive a grace period and spaced retries, using the existing OS
+interface unit when a full repair is needed. A process lock prevents competing
+repairs. Relevant OS events and state changes are retained in a bounded log
+under `/var/lib/calc-network`. The calculator boot unit no longer waits for
+network-online; `run_ai.sh` relaunches an unexpectedly crashed app.
+
+Forty-two offline tests passed locally and the staged suite passed on the Pi.
+The healthy live recovery check left the original WPA/DHCP processes running
+and both network configuration fingerprints unchanged. No live Wi-Fi switch,
+reboot, camera capture, or paid API call was used for verification. The saved
+iPhone profile is present, but an actual hotspot handover remains untested.

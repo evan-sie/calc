@@ -15,7 +15,7 @@ except ImportError:  # Show an actionable error in the UI if setup is incomplete
     OpenAI = None
 import curses
 import textwrap
-import cv2
+from wifi_manager import WifiController
 
 # --- USER CONFIGURATION ---
 # API keys live outside the repo so they are never committed. See RESTORE.md.
@@ -412,8 +412,8 @@ def get_diagnostics_styled():
 
         # WiFi signal bar + dBm (unchanged behavior from before)
         try:
-            ssid = subprocess.run(["iwgetid", "-r"], capture_output=True, text=True, check=True).stdout.strip()
-            link = subprocess.run(["iw", "dev", "wlan0", "link"], capture_output=True, text=True, check=True).stdout
+            ssid = subprocess.run(["iwgetid", "-r"], capture_output=True, text=True, check=True, timeout=2).stdout.strip()
+            link = subprocess.run(["iw", "dev", "wlan0", "link"], capture_output=True, text=True, check=True, timeout=2).stdout
             match = re.search(r"signal: (-?\d+)", link)
             if ssid and match:
                 signal_dbm = int(match.group(1))
@@ -427,7 +427,7 @@ def get_diagnostics_styled():
                 segments.extend([(f" {ssid} ", normal), (str(signal_dbm), dbm_style)])
             else:
                 segments.extend([(" ", normal), ("NOWIFI", crit)])
-        except (subprocess.CalledProcessError, FileNotFoundError):
+        except (subprocess.SubprocessError, OSError):
             segments.extend([(" ", normal), ("NOWIFI", crit)])
 
         # GPT is the only backend. Keep its health visible beside the clock.
@@ -706,6 +706,7 @@ def get_startup_splash_lines():
     return [
         "F1      Capture & analyze image",
         "SYM+F1  Toggle camera viewfinder",
+        "SYM+F2  Wi-Fi networks / IP / offline",
         "F2      Toggle this splashscreen",
         "F4      Toggle SHIFT  (SYM, 1-press)",
         "F5      Toggle NUM/ALPHA",
@@ -714,7 +715,6 @@ def get_startup_splash_lines():
         "Enter   Send text message",
         "F3      Clear input / stop request",
         "Up/Down Scroll chat history",
-        "",
         "RSSI    [[[G]]-30[[/G]], [[R]]-90[[/R]]] dBm",
         f"IP      {get_wlan_ip()}",
     ]
@@ -1523,21 +1523,67 @@ def refresh_model_header():
             header_lines[0] = get_diagnostics_styled()
 
 
-def wait_for_network(stdscr):
-    animation_frames = ['   ', '.  ', '.. ', '...']
-    frame_index = 0
+wifi = WifiController()
+
+
+def show_network_menu(stdscr):
+    """Leave instantly even during a scan, switch, or DHCP timeout."""
+    stop_viewfinder()
+    wifi.start()
+    selected = 0
+    stdscr.timeout(50)
     while True:
-        try:
-            if "inet " in subprocess.run(["ip", "addr", "show", "wlan0"], capture_output=True, text=True).stdout:
-                break
-        except Exception:
-            pass
-        stdscr.clear()
-        wait_text = "Connecting to Network" + animation_frames[frame_index]
-        stdscr.addstr(0, 0, wait_text, STYLES['normal'])
+        data = wifi.snapshot()
+        if not data['busy'] and time.monotonic() - wifi.updated > 3:
+            wifi.start()
+        h, w = stdscr.getmaxyx()
+        profiles = data['profiles']
+        selected = max(0, min(selected, len(profiles) - 1))
+        lines = ["WI-FI NETWORKS", f"{data['state']}  {data['ssid']}",
+                 f"IP: {data['ip'] or 'no address'}", "",
+                 "Saved networks (Enter connects):"]
+        rows = max(1, h - 12)
+        start = max(0, selected - rows + 1)
+        for index, profile in enumerate(profiles[start:start + rows], start):
+            dbm = data['signals'].get(profile['ssid'])
+            signal_text = f'{dbm}dBm' if dbm is not None else 'not seen'
+            current = '*' if profile['id'] == data.get('id') else ' '
+            lines.append(f"{'>' if index == selected else ' '}{current} {profile['ssid']} {signal_text}")
+        if not profiles:
+            lines.append('(none loaded; F1 retries Wi-Fi control)')
+        lines += ['', data['message'] + (' [working]' if data['busy'] else ''),
+                  'iPhone: Compatibility + Allow Others to Join',
+                  'F1 reconnect | F5 scan | Up/Down select', 'F2 back / continue offline | F3 stop GPT']
+        stdscr.erase()
+        for y, line in enumerate(lines[:h]):
+            try:
+                style = STYLES['normal'] | (curses.A_BOLD if y == 0 else 0)
+                stdscr.addnstr(y, 0, line, max(0, w - 1), style)
+            except curses.error:
+                pass
         stdscr.refresh()
-        frame_index = (frame_index + 1) % len(animation_frames)
-        time.sleep(0.5)
+        key = stdscr.getch()
+        if key in (curses.KEY_F2, 27):
+            return
+        if key == curses.KEY_UP:
+            selected = max(0, selected - 1)
+        elif key == curses.KEY_DOWN:
+            selected = min(len(profiles) - 1, selected + 1)
+        elif key in (curses.KEY_ENTER, 10) and profiles:
+            wifi.start('connect', profiles[selected]['id'])
+        elif key == curses.KEY_F1:
+            wifi.start('reconnect')
+        elif key == curses.KEY_F5:
+            wifi.start('scan')
+        elif key == curses.KEY_F3:
+            cancel_request()
+        # A modal menu must still collect finished/canceled model requests.
+        tick_request(w)
+
+
+def network_shortcut(key):
+    """Available even while the initial class confirmation is showing."""
+    return sym_active and key == curses.KEY_F2
 
 
 def update_diagnostics_periodically():
@@ -1614,10 +1660,13 @@ def main(stdscr):
 
     initialize_theme(stdscr)
     stdscr.keypad(True)
-    wait_for_network(stdscr)
+    # No network wait: the UI must boot and accept keys with Wi-Fi absent.
+    wifi.start()
 
     # Startup splash: FUNCTIONS  (F4 dismiss / F5 -> keyboard map)
     show_splash_system(stdscr)
+    if not wifi.snapshot()['ready']:
+        show_network_menu(stdscr)
 
     stdscr.timeout(50)
     height, width = stdscr.getmaxyx()
@@ -1673,6 +1722,18 @@ def main(stdscr):
             restart_confirm_active = False
             chat_history.pop()
             needs_redraw = True
+
+        # Handle SHIFT before the context prompt, so Wi-Fi remains reachable.
+        if context_confirm_active and key == curses.KEY_F4:
+            sym_active = not sym_active
+            refresh_model_header()
+            continue
+        if network_shortcut(key):
+            sym_active = False
+            show_network_menu(stdscr)
+            refresh_model_header()
+            needs_redraw = True
+            continue
 
         if context_confirm_active:
             if key == curses.KEY_ENTER or key == 10:

@@ -23,6 +23,6 @@ swaymsg reload 2>/dev/null
 swaymsg input "0:0:wlr_virtual_keyboard_v1" repeat_rate 0 2>/dev/null
 
 # 5. Relaunch UI
-swaymsg exec "foot -a foot -e python3 /root/casio_ai.py"
+swaymsg exec "foot -a foot -e /root/run_ai.sh"
 
 echo "Cyberdeck Interface Re-initialized."

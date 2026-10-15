@@ -7,6 +7,8 @@ runtime files into place.
 ## Important Files
 
 - `casio_ai.py` -> `/root/casio_ai.py`
+- `wifi_manager.py` -> `/root/wifi_manager.py`
+- `run_ai.sh` -> `/root/run_ai.sh`
 - `setup_calc.sh` -> `/root/setup_calc.sh`
 - `cyberdeck_boot.sh` -> `/root/cyberdeck_boot.sh`
 - `restart_ai.sh` -> `/root/restart_ai.sh`
@@ -15,6 +17,8 @@ runtime files into place.
 - `config/wayvnc/config` -> `/root/.config/wayvnc/config`
 - `systemd/cyberdeck.service` -> `/etc/systemd/system/cyberdeck.service`
 - `systemd/wifi-ensure.service` -> `/etc/systemd/system/wifi-ensure.service`
+- `systemd/wifi-ensure.timer` -> `/etc/systemd/system/wifi-ensure.timer`
+- `systemd/calc-wifi-dhcp.service` -> `/etc/systemd/system/calc-wifi-dhcp.service`
 - `cg-virtual-monitor/vnc-client` -> `/root/cg-virtual-monitor/vnc-client`
 
 ## Copy Files On The Pi
@@ -23,6 +27,8 @@ Run these commands from the cloned repo on the Raspberry Pi:
 
 ```bash
 install -m 755 casio_ai.py /root/casio_ai.py
+install -m 644 wifi_manager.py /root/wifi_manager.py
+install -m 755 run_ai.sh /root/run_ai.sh
 install -m 755 setup_calc.sh /root/setup_calc.sh
 install -m 755 cyberdeck_boot.sh /root/cyberdeck_boot.sh
 install -m 755 restart_ai.sh /root/restart_ai.sh
@@ -37,8 +43,12 @@ cp -a cg-virtual-monitor/vnc-client /root/cg-virtual-monitor/
 
 install -m 644 systemd/cyberdeck.service /etc/systemd/system/cyberdeck.service
 install -m 644 systemd/wifi-ensure.service /etc/systemd/system/wifi-ensure.service
+install -m 644 systemd/wifi-ensure.timer /etc/systemd/system/wifi-ensure.timer
+install -m 644 systemd/calc-wifi-dhcp.service /etc/systemd/system/calc-wifi-dhcp.service
 systemctl daemon-reload
-systemctl enable cyberdeck.service wifi-ensure.service
+systemctl enable cyberdeck.service
+systemctl disable wifi-ensure.service || true
+systemctl enable --now wifi-ensure.timer
 ```
 
 ## OpenAI API Key
@@ -111,6 +121,47 @@ summary text. This distinguishes missing provider summaries from display
 problems using a normal request rather than paid diagnostic generations.
 
 ## DietPi Settings To Reapply
+
+### Wi-Fi controls and recovery
+
+The existing DietPi ifupdown configuration and
+`/etc/wpa_supplicant/wpa_supplicant.conf` remain authoritative. This app never
+reads passwords, changes that file, saves transient selections, or assigns a
+static IP. Install `wpasupplicant`, `iproute2`, and `isc-dhcp-client` on restore.
+
+Press F4 then F2 (SYM+F2) for live status/IP and saved networks. Up/Down selects,
+Enter connects, F1 reconnects using the OS interface unit, F5 scans, and F2
+returns immediately. Returning does not cancel a network operation or clear
+chat history. This shortcut also works during the class-context confirmation.
+On an offline startup, closing the normal help opens the network menu;
+F2 continues offline. Neither the app nor its boot service waits for Wi-Fi.
+
+The timer checks every 20 seconds. Healthy associations with an IPv4 address
+and default route are left untouched. Failed connections get a 90-second grace
+period, then bounded recovery with up to five-minute spacing. An in-progress
+OS interface-start job is left alone. A shared lock prevents manual switching
+and automatic repair from running together. Switching temporarily raises the
+chosen profile's priority, leaves fallback profiles enabled, and obtains a new
+DHCP lease for the new subnet. A separate service owns that DHCP client so
+restarting the UI cannot kill it. Normal boot still uses the original DHCP
+client started by ifupdown. No internet availability is inferred from Wi-Fi
+association alone; API failures retain the existing retry/stop controls.
+
+Network state transitions and relevant kernel/WPA/DHCP messages are retained
+across reboot in `/var/lib/calc-network/events.log` (three files, 256 KiB each).
+They contain network diagnostics, not API requests or Wi-Fi passwords.
+`systemctl status wifi-ensure.timer` checks automatic recovery.
+`run_ai.sh` restarts Python after an unexpected app crash while keeping the
+terminal visible; it never resets the network. A crashed process loses its
+in-memory chat, just as a manual program restart does.
+
+For the saved `iPhone` hotspot, turn on Allow Others to Join and Maximize
+Compatibility, and leave the Personal Hotspot screen open while connecting.
+The saved SSID and password must match the phone. A new or renamed network
+must first be provisioned through DietPi; the calculator menu reuses saved
+profiles, including their existing enterprise certificate settings.
+
+### Other settings
 
 The README log notes these settings were important on DietPi:
 

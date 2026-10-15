@@ -14,6 +14,8 @@ git clone https://github.com/evan-sie/calc.git /root/calc
 
 echo "Step 4: Copy files"
 cp /root/calc/casio_ai.py /root/casio_ai.py
+cp /root/calc/wifi_manager.py /root/wifi_manager.py
+cp /root/calc/run_ai.sh /root/run_ai.sh
 cp /root/calc/cyberdeck_boot.sh /root/cyberdeck_boot.sh
 cp /root/calc/restart_ai.sh /root/restart_ai.sh
 cp /root/calc/autostart_cyberdeck.sh /root/autostart_cyberdeck.sh
@@ -26,12 +28,14 @@ cp /root/calc/config/wayvnc/config /root/.config/wayvnc/config
 
 cp /root/calc/systemd/cyberdeck.service /etc/systemd/system/cyberdeck.service
 cp /root/calc/systemd/wifi-ensure.service /etc/systemd/system/wifi-ensure.service
+cp /root/calc/systemd/wifi-ensure.timer /etc/systemd/system/wifi-ensure.timer
+cp /root/calc/systemd/calc-wifi-dhcp.service /etc/systemd/system/calc-wifi-dhcp.service
 
 mkdir -p /root/cg-virtual-monitor
 cp -r /root/calc/cg-virtual-monitor/vnc-client /root/cg-virtual-monitor/
 
 echo "Step 5: Make scripts executable"
-chmod +x /root/casio_ai.py /root/cyberdeck_boot.sh /root/restart_ai.sh /root/autostart_cyberdeck.sh
+chmod +x /root/casio_ai.py /root/run_ai.sh /root/cyberdeck_boot.sh /root/restart_ai.sh /root/autostart_cyberdeck.sh
 
 echo "Step 8: Build the VNC bridge"
 cd /root/cg-virtual-monitor/vnc-client
@@ -57,7 +61,8 @@ make -j2 || {
 echo "Step 9: Reload and enable services"
 systemctl daemon-reload
 systemctl enable cyberdeck.service
-systemctl enable wifi-ensure.service
+systemctl disable wifi-ensure.service || true
+systemctl enable --now wifi-ensure.timer
 
 echo "Step 10: Start service"
 systemctl restart cyberdeck.service

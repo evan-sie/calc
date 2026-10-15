@@ -1,0 +1,10 @@
+[Unit]
+Description=DHCP client after a calculator WiFi switch
+After=network.target
+
+[Service]
+Type=forking
+PIDFile=/run/dhclient.wlan0.pid
+ExecStart=/usr/sbin/dhclient -4 -nw -pf /run/dhclient.wlan0.pid -lf /var/lib/dhcp/dhclient.wlan0.leases wlan0
+TimeoutStartSec=12
+# Started only for a deliberate renewal; normal boot keeps using ifupdown.
